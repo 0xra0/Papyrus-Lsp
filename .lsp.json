@@ -1,0 +1,8 @@
+{
+  "papyrus": {
+    "command": "/home/home/.local/bin/papyrus-lsp",
+    "extensionToLanguage": {
+      ".psc": "papyrus"
+    }
+  }
+}

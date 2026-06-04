@@ -1,0 +1,40 @@
+{
+  "name": "papyrus-lsp",
+  "version": "1.2.0",
+  "description": "Full-featured Language Server Protocol implementation for Bethesda's Papyrus scripting language (Starfield, Skyrim, Fallout 4)",
+  "keywords": ["papyrus", "lsp", "starfield", "skyrim", "bethesda", "language-server"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/0xra0/Papyrus-Lsp"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "scripts/",
+    "scripts-db.json",
+    ".lsp.json",
+    "README.md"
+  ],
+  "bin": {
+    "papyrus-lsp": "./bin/papyrus-lsp"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -watch",
+    "postinstall": "npm run build",
+    "rebuild-db": "node scripts/build-db.js",
+    "test": "node tests/integration.test.js"
+  },
+  "dependencies": {
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-textdocument": "^1.0.11"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "typescript": "^5.3.3"
+  }
+}
