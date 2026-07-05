@@ -46,6 +46,12 @@ import {
   FoldingRange,
   SelectionRange,
   SelectionRangeParams,
+  DocumentDiagnosticReportKind,
+  DocumentDiagnosticReport,
+  DocumentDiagnosticParams,
+  WorkspaceDiagnosticReport,
+  WorkspaceDiagnosticParams,
+  WorkspaceDocumentDiagnosticReport,
 } from 'vscode-languageserver/node';
 import {
   TypeHierarchyItem,
@@ -57,6 +63,9 @@ import { TextDocument } from 'vscode-languageserver-textdocument';
 
 const connection = createConnection(ProposedFeatures.all, process.stdin, process.stdout);
 const documents = new TextDocuments<TextDocument>(TextDocument);
+
+// Client-capability flags captured at initialize (drive live-diagnostics behaviour).
+let clientDiagRefreshSupport = false;
 
 // ── Keyword table ─────────────────────────────────────────────────────────────
 
@@ -1372,6 +1381,9 @@ function loadScriptDb(dbPath: string): void {
 }
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
+  // Whether the client can be asked to re-pull diagnostics (LSP `workspace/diagnostic/refresh`).
+  clientDiagRefreshSupport = params.capabilities?.workspace?.diagnostics?.refreshSupport === true;
+
   // Store workspace root for later (batch diagnostics, etc.)
   const rootUri = params.rootUri ?? (params.workspaceFolders?.[0]?.uri ?? null);
   if (rootUri) {
@@ -1395,7 +1407,11 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
 
   return {
     capabilities: {
-      textDocumentSync: TextDocumentSyncKind.Incremental,
+      textDocumentSync: {
+        openClose: true,
+        change: TextDocumentSyncKind.Incremental,
+        save: { includeText: false }, // enables didSave → authoritative recheck
+      },
       completionProvider: { triggerCharacters: ['.'], resolveProvider: true },
       hoverProvider: true,
       signatureHelpProvider: { triggerCharacters: ['(', ','] },
@@ -1413,6 +1429,11 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       executeCommandProvider:    { commands: ['papyrus.checkAllScripts'] },
       selectionRangeProvider:    true,
       documentFormattingProvider: true,
+      diagnosticProvider: {
+        identifier: 'papyrus',
+        interFileDependencies: true,
+        workspaceDiagnostics: true,
+      },
       semanticTokensProvider: {
         legend: {
           tokenTypes:     ['class', 'function', 'event', 'property', 'variable', 'parameter'],
@@ -1582,8 +1603,10 @@ function extractScriptName(text: string): string | null {
   return null;
 }
 
-/** Run PapyrusCompiler.exe and return its diagnostics via callback (no side-effects). */
-function collectCompilerDiags(doc: TextDocument, cb: (diags: Diagnostic[]) => void): void {
+/** Run PapyrusCompiler.exe and return its diagnostics via callback (no side-effects).
+ *  Returns the spawned child process (or null if it bailed before spawning) so callers
+ *  can cancel a stale run when a newer edit arrives. */
+function collectCompilerDiags(doc: TextDocument, cb: (diags: Diagnostic[]) => void): ReturnType<typeof execFile> | null {
   const text = doc.getText();
   const scriptName = extractScriptName(text) ?? path.basename(doc.uri.replace(/^file:\/\//, ''), '.psc');
 
@@ -1593,7 +1616,7 @@ function collectCompilerDiags(doc: TextDocument, cb: (diags: Diagnostic[]) => vo
   try { fs.writeFileSync(tempFile, text, 'utf8'); } catch (e) {
     connection.console.warn(`[papyrus-lsp] could not write temp file: ${e}`);
     try { fs.rmSync(runDir, { recursive: true, force: true }); } catch {}
-    cb([]); return;
+    cb([]); return null;
   }
 
   const modExtendersDir = path.join(__dirname, '..', 'mod-extenders');
@@ -1610,7 +1633,7 @@ function collectCompilerDiags(doc: TextDocument, cb: (diags: Diagnostic[]) => vo
     '-quiet',
   ];
 
-  execFile('mono', args, { timeout: 15000 }, (_err, stdout, stderr) => {
+  return execFile('mono', args, { timeout: 15000 }, (_err, stdout, stderr) => {
     try { fs.rmSync(runDir, { recursive: true, force: true }); } catch {}
 
     const output = stdout + stderr;
@@ -2630,15 +2653,15 @@ function checkSemantics(doc: TextDocument): Diagnostic[] {
   return diags;
 }
 
-function sendDiagnostics(doc: TextDocument): void {
-  indexDocument(doc);
+/** Run the fast native diagnostic suite (parser + semantic checks). No compiler, no I/O spawn. */
+function computeNativeDiagnostics(doc: TextDocument): Diagnostic[] {
   const text = doc.getText();
   const compilerAvailable = fs.existsSync(cfg.compilerExe) && fs.existsSync(cfg.flagsFile);
 
   // Native suite always runs — provides immediate feedback and works without the compiler.
   // checkSemantics is included only when the compiler is absent; the compiler supersedes
   // it with authoritative type/name errors so there are no duplicates.
-  const native: Diagnostic[] = [
+  return [
     ...parsePapyrus(text).map(rawToDiag),
     ...checkMissingReturns(text).map(rawToDiag),
     ...checkTypeMismatch(doc),
@@ -2651,44 +2674,200 @@ function sendDiagnostics(doc: TextDocument): void {
     ...analyzeUnusedLocals(doc),
     ...(compilerAvailable ? [] : checkSemantics(doc)),
   ];
-
-  connection.sendDiagnostics({ uri: doc.uri, diagnostics: native });
-
-  if (compilerAvailable) {
-    // Augment with compiler results when they arrive.
-    // On lines where the compiler reports errors, its messages replace native ones
-    // (compiler is authoritative for type/name errors). Hints are always kept.
-    collectCompilerDiags(doc, compilerDiags => {
-      if (!compilerDiags.length) return; // compiler clean — native results stand as-is
-      const compilerLines = new Set(compilerDiags.map(d => d.range.start.line));
-      const filtered = native.filter(d =>
-        d.tags?.includes(DiagnosticTag.Unnecessary) ||
-        d.severity === DiagnosticSeverity.Hint ||
-        !compilerLines.has(d.range.start.line)
-      );
-      connection.sendDiagnostics({ uri: doc.uri, diagnostics: [...filtered, ...compilerDiags] });
-    });
-  }
 }
 
-// Debounce onChange — don't invoke compiler on every keystroke
-const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+/** Merge compiler diagnostics over native ones: on lines the compiler flags, its
+ *  authoritative messages replace native errors; hints/unnecessary tags are always kept. */
+function mergeCompilerDiags(native: Diagnostic[], compilerDiags: Diagnostic[]): Diagnostic[] {
+  if (!compilerDiags.length) return native; // compiler clean — native results stand as-is
+  const compilerLines = new Set(compilerDiags.map(d => d.range.start.line));
+  const filtered = native.filter(d =>
+    d.tags?.includes(DiagnosticTag.Unnecessary) ||
+    d.severity === DiagnosticSeverity.Hint ||
+    !compilerLines.has(d.range.start.line)
+  );
+  return [...filtered, ...compilerDiags];
+}
 
+// Shared cache so the push path (publishDiagnostics) and the pull path
+// (textDocument/diagnostic) don't each spawn the compiler for the same edit.
+// `final` = true once compiler results are folded in (or the compiler is unavailable);
+// a native-only entry (final:false) is still refined by the compiler on a pull.
+const diagCache = new Map<string, { version: number; diags: Diagnostic[]; final: boolean }>();
+
+// De-dupe concurrent full computes for the same uri@version (e.g. overlapping pulls,
+// or a pull racing the debounced push) so the compiler runs at most once per version.
+const pendingCompute = new Map<string, Promise<Diagnostic[]>>();
+
+/** Compute the full diagnostic set for a document (native + compiler when available),
+ *  caching by document version. Both push and pull go through this. */
+function computeDiagnostics(doc: TextDocument): Promise<Diagnostic[]> {
+  const cached = diagCache.get(doc.uri);
+  if (cached && cached.version === doc.version && cached.final) return Promise.resolve(cached.diags);
+
+  const key = `${doc.uri}@${doc.version}`;
+  const existing = pendingCompute.get(key);
+  if (existing) return existing;
+
+  indexDocument(doc);
+  const native = computeNativeDiagnostics(doc);
+  const compilerAvailable = fs.existsSync(cfg.compilerExe) && fs.existsSync(cfg.flagsFile);
+
+  if (!compilerAvailable) {
+    diagCache.set(doc.uri, { version: doc.version, diags: native, final: true });
+    return Promise.resolve(native);
+  }
+
+  const p = new Promise<Diagnostic[]>(resolve => {
+    collectCompilerDiags(doc, compilerDiags => {
+      pendingCompute.delete(key);
+      const merged = mergeCompilerDiags(native, compilerDiags);
+      diagCache.set(doc.uri, { version: doc.version, diags: merged, final: true });
+      resolve(merged);
+    });
+  });
+  pendingCompute.set(key, p);
+  return p;
+}
+
+// ── Live diagnostics (two-tier, clangd-style) ─────────────────────────────────
+// Fast native checks publish instantly on every edit; the slower compiler pass is
+// debounced, cancellable, and stale-guarded so a late result never clobbers a newer
+// edit. Every publish carries the document version so the client can drop stale sets.
+
+const debounceTimers   = new Map<string, ReturnType<typeof setTimeout>>();
+const inFlightCompiler = new Map<string, ReturnType<typeof execFile>>();
+
+/** Publish the instant native suite for the document's current version. */
+function publishNative(doc: TextDocument): Diagnostic[] {
+  indexDocument(doc);
+  const native = computeNativeDiagnostics(doc);
+  // Native is the final word only when there's no compiler to refine it.
+  const compilerAvailable = fs.existsSync(cfg.compilerExe) && fs.existsSync(cfg.flagsFile);
+  diagCache.set(doc.uri, { version: doc.version, diags: native, final: !compilerAvailable });
+  connection.sendDiagnostics({ uri: doc.uri, version: doc.version, diagnostics: native });
+  return native;
+}
+
+/** Run the compiler in the background and merge its authoritative results on top of
+ *  `native`, cancelling any older run for the same file and discarding stale output. */
+function augmentWithCompiler(doc: TextDocument, native: Diagnostic[]): void {
+  if (!(fs.existsSync(cfg.compilerExe) && fs.existsSync(cfg.flagsFile))) return;
+  const uri = doc.uri;
+  const version = doc.version;
+
+  // Cancel a compiler run still churning on an older version of this file.
+  const prev = inFlightCompiler.get(uri);
+  if (prev) { try { prev.kill(); } catch {} inFlightCompiler.delete(uri); }
+
+  const child = collectCompilerDiags(doc, compilerDiags => {
+    if (inFlightCompiler.get(uri) === child) inFlightCompiler.delete(uri);
+    // Discard if the document moved on (a newer edit owns the output now). This also
+    // absorbs the empty callback a killed process fires, so we never clear on cancel.
+    const live = documents.get(uri);
+    if (!live || live.version !== version) return;
+
+    const merged = mergeCompilerDiags(native, compilerDiags);
+    diagCache.set(uri, { version, diags: merged, final: true });
+    if (!compilerDiags.length) return; // native already published and stands as-is
+    connection.sendDiagnostics({ uri, version, diagnostics: merged });
+    // A file's errors can change what its dependents see — ask the client to refresh.
+    requestInterFileRefresh();
+  });
+  if (child) inFlightCompiler.set(uri, child);
+}
+
+/** Full check for a document: instant native + background compiler. */
+function sendDiagnostics(doc: TextDocument): void {
+  const native = publishNative(doc);
+  augmentWithCompiler(doc, native);
+}
+
+/** On every keystroke: publish native immediately, debounce the compiler pass. */
 function scheduleDiagnostics(doc: TextDocument): void {
   const uri = doc.uri;
+  const native = publishNative(doc);
   const t = debounceTimers.get(uri);
   if (t) clearTimeout(t);
   debounceTimers.set(uri, setTimeout(() => {
     debounceTimers.delete(uri);
-    sendDiagnostics(doc);
+    const live = documents.get(uri);
+    if (live && live.version === doc.version) augmentWithCompiler(live, native);
   }, 600));
+}
+
+// Coalesced inter-file refresh: when a file's compiler diagnostics change, its
+// dependents may too. Pull-capable clients are asked once to re-pull everything
+// (our pull handlers recompute on demand); a no-op for push-only clients.
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+function requestInterFileRefresh(): void {
+  if (refreshTimer || !clientDiagRefreshSupport) return; // coalescing, or nothing to do
+  refreshTimer = setTimeout(() => {
+    refreshTimer = undefined;
+    try { connection.languages.diagnostics.refresh(); } catch { /* client declined */ }
+  }, 400);
 }
 
 documents.onDidOpen(e => sendDiagnostics(e.document));
 documents.onDidChangeContent(e => scheduleDiagnostics(e.document));
+documents.onDidSave(e => sendDiagnostics(e.document)); // authoritative recheck on save
 documents.onDidClose(e => {
-  debounceTimers.delete(e.document.uri);
-  connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] });
+  const uri = e.document.uri;
+  const t = debounceTimers.get(uri);
+  if (t) { clearTimeout(t); debounceTimers.delete(uri); }
+  const c = inFlightCompiler.get(uri);
+  if (c) { try { c.kill(); } catch {} inFlightCompiler.delete(uri); }
+  diagCache.delete(uri);
+  connection.sendDiagnostics({ uri, diagnostics: [] });
+});
+
+// ── Pull diagnostics (LSP 3.17) ───────────────────────────────────────────────
+// clangd and most modern servers advertise `diagnosticProvider` and answer
+// `textDocument/diagnostic` / `workspace/diagnostic` on demand, in addition to
+// pushing via publishDiagnostics. This is what drives Claude Code's
+// "Found N new diagnostic issues in M files" surfacing after edits.
+
+/** Resolve a document for a pull request: prefer the open copy, else read from disk. */
+function getDocForDiagnostics(uri: string): TextDocument | undefined {
+  const open = documents.get(uri);
+  if (open) return open;
+  const fsPath = uri.replace(/^file:\/\//, '');
+  try {
+    const text = fs.readFileSync(decodeURIComponent(fsPath), 'utf8');
+    return TextDocument.create(uri, 'papyrus', 0, text);
+  } catch {
+    return undefined;
+  }
+}
+
+connection.languages.diagnostics.on(async (params: DocumentDiagnosticParams): Promise<DocumentDiagnosticReport> => {
+  const doc = getDocForDiagnostics(params.textDocument.uri);
+  if (!doc) {
+    return { kind: DocumentDiagnosticReportKind.Full, items: [] };
+  }
+  const diags = await computeDiagnostics(doc);
+  return { kind: DocumentDiagnosticReportKind.Full, items: diags };
+});
+
+connection.languages.diagnostics.onWorkspace(async (_params: WorkspaceDiagnosticParams): Promise<WorkspaceDiagnosticReport> => {
+  // Report for the documents currently open in the client. We use fast native
+  // checks here (no per-file compiler spawn) so a workspace pull stays cheap even
+  // with thousands of scripts in scanDirs; the compiler still augments the
+  // focused document through the single-document pull and the push path.
+  const items: WorkspaceDocumentDiagnosticReport[] = [];
+  for (const doc of documents.all()) {
+    const cached = diagCache.get(doc.uri);
+    const diags = cached && cached.version === doc.version
+      ? cached.diags
+      : (indexDocument(doc), computeNativeDiagnostics(doc));
+    items.push({
+      kind: DocumentDiagnosticReportKind.Full,
+      uri: doc.uri,
+      version: doc.version,
+      items: diags,
+    });
+  }
+  return { items };
 });
 
 connection.onCompletion((params: CompletionParams): CompletionItem[] => {

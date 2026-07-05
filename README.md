@@ -81,7 +81,12 @@ Add to your Claude Code LSP plugin config (`.lsp.json`):
 - **Document symbols** — Ctrl+Shift+O outline of functions, events, properties, structs, custom events
 
 ### Diagnostics
-- **Compiler-backed diagnostics** — full semantic checking via `PapyrusCompiler.exe -noasm`, run on every save (debounced 600ms)
+Live, two-tier diagnostics modeled on clangd: fast checks appear as you type, the compiler refines them in the background.
+
+- **Instant native suite** — parser errors, missing returns, type mismatches, structural/access checks, unused imports and locals; published on **every keystroke** with no compiler required
+- **Compiler-backed diagnostics** — full semantic checking via `PapyrusCompiler.exe -noasm`, run in the background (debounced 600ms) and again on save; compiler results supersede native ones on the same line
+- **Live-editing guarantees** — every `publishDiagnostics` carries the document version; a late compiler result never overwrites a newer edit (stale-guarding); an in-flight `mono` run is cancelled when you edit again, so runs never pile up
+- **Pull diagnostics (LSP 3.17)** — advertises `diagnosticProvider` and answers `textDocument/diagnostic` and `workspace/diagnostic`, in addition to pushing via `publishDiagnostics` (the same both-ways model clangd uses). This is what lets editors and headless clients like Claude Code report "Found N new diagnostic issues in M files" after an edit. Push and pull share a per-version cache so an edit never runs the compiler twice, and pull-capable clients are asked to refresh dependents when a file's errors change.
 - **Workspace-wide check** — run `papyrus.checkAllScripts` from the command palette to compile every `.psc` in the workspace
 - **Code actions** — "Did you mean X?" suggestions and "Add import Y" quick-fixes
 

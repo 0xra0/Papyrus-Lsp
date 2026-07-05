@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "papyrus-plugins",
+  "description": "Papyrus (Bethesda scripting) language tooling for Claude Code",
+  "owner": {
+    "name": "local"
+  },
+  "plugins": [
+    {
+      "name": "papyrus-lsp",
+      "description": "Papyrus LSP for Claude Code — live diagnostics, completions, hover, and navigation for .psc files (Starfield, Skyrim, Fallout 4)",
+      "category": "language-server",
+      "source": "./"
+    }
+  ]
+}
