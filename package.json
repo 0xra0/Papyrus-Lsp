@@ -1,6 +1,6 @@
 {
   "name": "papyrus-lsp",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Full-featured Language Server Protocol implementation for Bethesda's Papyrus scripting language (Starfield, Skyrim, Fallout 4)",
   "keywords": ["papyrus", "lsp", "starfield", "skyrim", "bethesda", "language-server"],
   "license": "MIT",

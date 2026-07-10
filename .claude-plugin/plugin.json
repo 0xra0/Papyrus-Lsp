@@ -1,6 +1,6 @@
 {
   "name": "papyrus-lsp",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Papyrus scripting language LSP for Claude Code — live diagnostics (push + pull), syntax checking, completions, hover docs, and navigation for .psc files",
   "author": { "name": "local" }
 }
