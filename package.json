@@ -20,7 +20,8 @@
     "README.md"
   ],
   "bin": {
-    "papyrus-lsp": "./bin/papyrus-lsp"
+    "papyrus-lsp": "./bin/papyrus-lsp",
+    "papyrus-check": "./bin/papyrus-check"
   },
   "scripts": {
     "build": "tsc",

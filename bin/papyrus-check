@@ -1,0 +1,314 @@
+#!/usr/bin/env node
+'use strict';
+/**
+ * papyrus-check — run the Papyrus diagnostic suite from the command line.
+ *
+ * Speaks LSP to the same dist/server.js an editor drives, so what CI reports is
+ * exactly what you see while typing. A single `textDocument/diagnostic` pull
+ * resolves only once the compiler-backed pass has folded in, so there is no
+ * polling and no guessing about when results are final.
+ *
+ * Exit status: 0 clean, 1 diagnostics found, 2 bad usage or server failure.
+ */
+const { spawn } = require('child_process');
+const fs   = require('fs');
+const path = require('path');
+const { pathToFileURL } = require('url');
+
+const SERVER_JS  = path.join(__dirname, '..', 'dist', 'server.js');
+const SEVERITY   = { 1: 'error', 2: 'warn', 3: 'info', 4: 'hint' };
+const CONCURRENCY = 4;          // matches the server's own batch-check pool
+const REQUEST_TIMEOUT_MS = 120000;
+
+// ── CLI ───────────────────────────────────────────────────────────────────────
+
+/** Write every byte to `fd` synchronously.
+ *  process.stdout.write() on a pipe is async: process.exit() straight after it
+ *  truncates whatever is still buffered, which silently corrupts
+ *  `papyrus-check --json | jq` once output exceeds the pipe buffer. */
+function writeSyncAll(fd, text) {
+  const buf = Buffer.from(text, 'utf8');
+  let off = 0;
+  while (off < buf.length) {
+    try {
+      off += fs.writeSync(fd, buf, off);
+    } catch (err) {
+      if (err.code === 'EAGAIN') continue;  // non-blocking pipe; retry
+      if (err.code === 'EPIPE') return;     // reader hung up, e.g. `| head`
+      throw err;
+    }
+  }
+}
+
+/** Flush, then exit. Never returns. */
+function writeAndExit(fd, text, code) {
+  writeSyncAll(fd, text);
+  process.exit(code);
+}
+
+function usage(fd, code) {
+  writeAndExit(fd, `Usage: papyrus-check [options] <file|dir>...
+
+Runs parser, structural, access, and compiler-backed diagnostics on .psc files.
+Directories are searched recursively.
+
+Options:
+  --root <dir>   Workspace root; sets import dirs and where .papyrus-lsp.json
+                 is searched from. Default: the common ancestor of the inputs.
+  --strict       Exit non-zero on warnings too, not just errors.
+  --json         Emit a JSON array of diagnostics instead of text.
+  --verbose      Show the server's startup log (import dirs, compiler in use).
+  -h, --help     Show this message.
+
+Exit status: 0 clean, 1 diagnostics found, 2 bad usage or server failure.
+`, code);
+}
+
+function parseArgs(argv) {
+  const opts = { root: null, strict: false, json: false, verbose: false, targets: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    switch (a) {
+      case '-h': case '--help': usage(1, 0); break;
+      case '--strict':  opts.strict  = true; break;
+      case '--json':    opts.json    = true; break;
+      case '--verbose': opts.verbose = true; break;
+      case '--root':
+        opts.root = argv[++i];
+        if (!opts.root) { writeSyncAll(2, '--root needs a directory\n'); usage(2, 2); }
+        break;
+      default:
+        if (a.startsWith('-')) { writeSyncAll(2, `unknown option: ${a}\n`); usage(2, 2); }
+        opts.targets.push(a);
+    }
+  }
+  if (!opts.targets.length) usage(2, 2);
+  return opts;
+}
+
+/** Expand files and directories into a de-duplicated list of .psc paths. */
+function collectPsc(target, out, seen) {
+  let st;
+  try { st = fs.statSync(target); } catch { throw new Error(`no such file or directory: ${target}`); }
+  if (st.isDirectory()) {
+    const real = fs.realpathSync(target);
+    if (seen.has(real)) return;            // don't loop on symlinked dirs
+    seen.add(real);
+    for (const e of fs.readdirSync(target)) collectPsc(path.join(target, e), out, seen);
+  } else if (target.toLowerCase().endsWith('.psc')) {
+    out.push(path.resolve(target));
+  }
+}
+
+/** Deepest directory containing every path. Used as the workspace root. */
+function commonAncestor(dirs) {
+  if (!dirs.length) return process.cwd();
+  const split = dirs.map(d => path.resolve(d).split(path.sep));
+  const first = split[0];
+  const parts = [];
+  for (let i = 0; i < first.length; i++) {
+    if (split.every(s => s[i] === first[i])) parts.push(first[i]);
+    else break;
+  }
+  return parts.join(path.sep) || path.sep;
+}
+
+// ── Minimal LSP client over stdio ─────────────────────────────────────────────
+
+function startServer(onLog) {
+  const child = spawn(process.execPath, [SERVER_JS], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const pending = new Map();
+  let nextId = 1;
+  let buf = Buffer.alloc(0);
+  let exited = null;
+
+  const send = (msg) => {
+    if (exited) return;
+    const body = Buffer.from(JSON.stringify({ jsonrpc: '2.0', ...msg }), 'utf8');
+    child.stdin.write(`Content-Length: ${body.length}\r\n\r\n`);
+    child.stdin.write(body);
+  };
+
+  child.stdout.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    for (;;) {
+      const sep = buf.indexOf('\r\n\r\n');
+      if (sep < 0) return;
+      const m = /content-length:\s*(\d+)/i.exec(buf.slice(0, sep).toString('utf8'));
+      if (!m) return;
+      const len = Number(m[1]);
+      if (buf.length < sep + 4 + len) return;
+      const body = buf.slice(sep + 4, sep + 4 + len).toString('utf8');
+      buf = buf.slice(sep + 4 + len);
+
+      let msg;
+      try { msg = JSON.parse(body); } catch { continue; }
+
+      if (msg.method === 'window/logMessage' || msg.method === 'window/showMessage') {
+        onLog(msg.params.message);
+      } else if (msg.id !== undefined && msg.method) {
+        send({ id: msg.id, result: null });   // answer server→client requests so it never stalls
+      } else if (msg.id !== undefined && pending.has(msg.id)) {
+        const { resolve, reject, timer } = pending.get(msg.id);
+        pending.delete(msg.id);
+        clearTimeout(timer);
+        msg.error ? reject(new Error(msg.error.message || 'request failed')) : resolve(msg.result);
+      }
+    }
+  });
+
+  child.stderr.on('data', d => onLog(String(d).trimEnd()));
+
+  const die = (err) => {
+    exited = err;
+    for (const { reject, timer } of pending.values()) { clearTimeout(timer); reject(err); }
+    pending.clear();
+  };
+  child.on('error', e => die(new Error(`could not start the language server: ${e.message}`)));
+  child.on('exit', (code, sig) => {
+    if (pending.size) die(new Error(`language server exited early (${sig || `code ${code}`})`));
+    else exited = exited || true;
+  });
+
+  return {
+    request(method, params) {
+      if (exited instanceof Error) return Promise.reject(exited);
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`timed out after ${REQUEST_TIMEOUT_MS / 1000}s waiting for ${method}`));
+        }, REQUEST_TIMEOUT_MS);
+        pending.set(id, { resolve, reject, timer });
+        send({ id, method, params });
+      });
+    },
+    notify: (method, params) => send({ method, params }),
+    stop: () => { try { child.kill(); } catch {} },
+  };
+}
+
+/** Run `worker` over `items` with at most `limit` in flight. Preserves input order. */
+async function pool(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await worker(items[i]);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+// ── Reporting ─────────────────────────────────────────────────────────────────
+
+/** Relative path when it stays under the cwd, absolute when it would climb out. */
+function displayPath(file) {
+  const rel = path.relative(process.cwd(), file);
+  return (!rel || rel.startsWith('..')) ? file : rel;
+}
+
+/** Render the report and decide the exit status. Returns the text to print. */
+function report(files, opts) {
+  const flat = [];
+  for (const { file, diags } of files)
+    for (const d of diags) flat.push({ file, d });
+
+  const errors   = flat.filter(x => x.d.severity === 1).length;
+  const warnings = flat.filter(x => x.d.severity === 2).length;
+  const code = errors > 0 || (opts.strict && warnings > 0) ? 1 : 0;
+
+  if (opts.json) {
+    const text = JSON.stringify(flat.map(({ file, d }) => ({
+      file,
+      line:     d.range.start.line + 1,
+      column:   d.range.start.character + 1,
+      severity: SEVERITY[d.severity] || String(d.severity),
+      message:  d.message,
+      source:   d.source,
+    })), null, 2) + '\n';
+    return { text, code };
+  }
+
+  if (!flat.length)
+    return { text: `No issues found in ${files.length} file${files.length === 1 ? '' : 's'}.\n`, code };
+
+  const out = [];
+  for (const { file, diags } of files) {
+    if (!diags.length) continue;
+    out.push(`\n${displayPath(file)}`);
+    for (const d of [...diags].sort((a, b) => a.range.start.line - b.range.start.line)) {
+      const pos = `${d.range.start.line + 1}:${d.range.start.character + 1}`;
+      const sev = SEVERITY[d.severity] || String(d.severity);
+      out.push(`  ${pos.padEnd(8)} ${sev.padEnd(6)} ${d.message}`);
+    }
+  }
+
+  const other = flat.length - errors - warnings;
+  const parts = [];
+  if (errors)   parts.push(`${errors} error${errors === 1 ? '' : 's'}`);
+  if (warnings) parts.push(`${warnings} warning${warnings === 1 ? '' : 's'}`);
+  if (other)    parts.push(`${other} note${other === 1 ? '' : 's'}`);
+  out.push(`\n${parts.join(', ')}`);
+
+  return { text: out.join('\n') + '\n', code };
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+
+  if (!fs.existsSync(SERVER_JS))
+    writeAndExit(2, `Server not built: ${SERVER_JS}\nRun \`npm run build\`.\n`, 2);
+
+  const paths = [];
+  const seen = new Set();
+  try {
+    for (const t of opts.targets) collectPsc(t, paths, seen);
+  } catch (err) {
+    writeAndExit(2, `papyrus-check: ${err.message}\n`, 2);
+    return;
+  }
+  const files = [...new Set(paths)];
+  if (!files.length) writeAndExit(2, 'No .psc files found in the given paths.\n', 2);
+
+  const root = opts.root
+    ? path.resolve(opts.root)
+    : commonAncestor(files.map(f => path.dirname(f)));
+
+  const onLog = opts.verbose ? (m) => writeSyncAll(2, `${m}\n`) : () => {};
+  const server = startServer(onLog);
+
+  try {
+    await server.request('initialize', {
+      processId: process.pid,
+      rootUri: pathToFileURL(root).href,
+      workspaceFolders: [{ uri: pathToFileURL(root).href, name: path.basename(root) }],
+      capabilities: { textDocument: { diagnostic: {} } },
+    });
+    server.notify('initialized', {});
+
+    // One pull per file. The server resolves each only after its compiler pass
+    // completes, so these results are final — no polling, no debounce races.
+    const results = await pool(files, CONCURRENCY, async (file) => {
+      const uri = pathToFileURL(file).href;
+      const rep = await server.request('textDocument/diagnostic', { textDocument: { uri } });
+      return { file, diags: (rep && rep.items) || [] };
+    });
+
+    const { text, code } = report(results, opts);
+    server.stop();
+    writeAndExit(1, text, code);
+  } catch (err) {
+    server.stop();
+    writeAndExit(2, `papyrus-check: ${err.message}\n`, 2);
+  }
+}
+
+main().catch((err) => {
+  writeAndExit(2, `papyrus-check: ${err && err.message ? err.message : err}\n`, 2);
+});
