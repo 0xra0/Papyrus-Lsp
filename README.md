@@ -1,6 +1,8 @@
 # papyrus-lsp
 
-Full-featured Language Server Protocol implementation for Bethesda's Papyrus scripting language. Works with Starfield, Skyrim, and Fallout 4 scripts.
+Full-featured Language Server Protocol implementation for Bethesda's Papyrus scripting language.
+
+The language support itself is game-agnostic and works on any `.psc`. What ships bundled is **Starfield**: the vanilla script dump, `Starfield_Papyrus_Flags.flg`, and `PapyrusCompiler.exe`. For Skyrim or Fallout 4, point `importDirs`, `flagsFile`, and `compilerPath` at that game's own copies — see [Configuration](#configuration).
 
 ## Requirements
 
@@ -21,7 +23,7 @@ npm run fetch-vanilla                # vanilla .psc sources + PapyrusCompiler.ex
 npm run rebuild-db                   # optional — cache the type index
 ```
 
-After installation the `papyrus-lsp` binary is available in your PATH.
+After installation two binaries are on your PATH: `papyrus-lsp`, the language server your editor launches, and [`papyrus-check`](#command-line), a headless diagnostics runner for CI.
 
 The server locates its bundled compiler and vanilla sources relative to its own install directory. `npm install -g .` links this clone, so fetching into the clone is enough. If you instead install a **packed** copy, note that `_vanilla-sf-scripts/` is excluded from the `files` whitelist and won't be present: run `fetch-vanilla` from inside the install directory, or point `compilerPath` and `importDirs` at copies you already have.
 
@@ -66,6 +68,20 @@ PAPYRUS_LSP_IMPORTS=/path/a:/path/b npm run rebuild-db
 ```
 
 The server watches the file and hot-reloads it when it changes, so a rebuild takes effect without a restart. Scripts in your workspace are layered on top of the cache at startup, so your own types resolve without rebuilding.
+
+## Mod extenders
+
+`mod-extenders/` holds declaration stubs for functions and types that SFSE plugins add at runtime. It is always appended to `importDirs`, so calls into them resolve without any configuration. Bundled today:
+
+| Script | Provides |
+|---|---|
+| `CassiopeiaPapyrusExtender.psc` | 439 native globals from Cassiopeia Papyrus Extender 9.4 by LarannKiar |
+| `CassiopeiaPapyrusEvents.psc` | Its 60 native event callbacks, and how to register for them |
+| `ArmorAddon.psc`, `Biome.psc` | Two base-game types missing from the vanilla script dump |
+
+To support another extender, drop its `.psc` in here and run `npm run rebuild-db`. Only declarations are needed — mark functions `native` so they parse without a body.
+
+Cassiopeia's own `CassiopeiaPapyrusEvents.txt` is documentation, not a compilable script: it embeds example snippets and lists the parameterless events as bare names. Our `.psc` restates those signatures as `global native` so they resolve with no body. In your script you implement them as ordinary `global` functions.
 
 ## Command line
 
