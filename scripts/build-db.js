@@ -3,13 +3,27 @@
 const fs = require('fs');
 const path = require('path');
 
-const DIRS = [
-  '/mnt/ssd/StarfieldCK/Tools/VSCodePapyrusAddon/starfield-vanilla-scripts/Source',
-  '/mnt/ssd/Starfield.Digital.Premium.Edition-InsaneRamZes/Data/Scripts',
-  '/mnt/ssd/Starfield.Digital.Premium.Edition-InsaneRamZes/Data/Data/Source/Scripts',
-  path.join(__dirname, '..', 'mod-extenders'),
+const ROOT = path.join(__dirname, '..');
+
+// Which source trees to index, in precedence order — later dirs override earlier
+// ones, so project scripts win over the vanilla copies they shadow.
+//
+//   node scripts/build-db.js [dir...]        explicit dirs
+//   PAPYRUS_LSP_IMPORTS=a:b node …/build-db  same, via the env var the server reads
+//   node scripts/build-db.js                 bundled vanilla + mod-extenders
+//
+// Defaults keep the build self-contained: nothing outside this repo is required.
+const DEFAULT_DIRS = [
+  path.join(ROOT, '_vanilla-sf-scripts', 'Scripts', 'Source'),
+  path.join(ROOT, 'mod-extenders'),
 ];
-const OUT = path.join(__dirname, '..', 'scripts-db.json');
+
+const argDirs = process.argv.slice(2);
+const envDirs = (process.env.PAPYRUS_LSP_IMPORTS || '').split(path.delimiter).filter(Boolean);
+const DIRS = (argDirs.length ? argDirs : envDirs.length ? envDirs : DEFAULT_DIRS)
+  .map(d => path.resolve(d));
+
+const OUT = process.env.PAPYRUS_LSP_DB || path.join(ROOT, 'scripts-db.json');
 
 const SCRIPTNAME_RE = /^\s*scriptname\s+(\S+)(?:\s+extends\s+(\S+))?/i;
 const FUNC_RE       = /^\s*(?:([\w\[\]]+)\s+)?function\s+(\w+)\s*\(([^)]*)\)([^;]*)/i;
@@ -177,9 +191,16 @@ function walkDir(dir, results) {
 console.log('Scanning scripts...');
 const db = new Map();
 for (const d of DIRS) {
+  if (!fs.existsSync(d)) { console.log(`  ${d}: missing, skipped`); continue; }
   const before = db.size;
   walkDir(d, db);
   console.log(`  ${d}: +${db.size - before} scripts`);
+}
+
+if (db.size === 0) {
+  console.error('\nNo .psc files found. Pass source dirs explicitly, or fetch the bundled\n' +
+                'vanilla scripts with `npm run fetch-vanilla`.');
+  process.exit(1);
 }
 
 const out = Object.fromEntries(db);

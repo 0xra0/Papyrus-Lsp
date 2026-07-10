@@ -5,8 +5,9 @@ Full-featured Language Server Protocol implementation for Bethesda's Papyrus scr
 ## Requirements
 
 - **Node.js** 18 or later
-- **Mono** (Linux/macOS) or .NET (Windows) — for compiler-backed diagnostics
-- A Papyrus compiler (`PapyrusCompiler.exe`) and flags file from the game's Creation Kit
+- **Mono** — only on Linux/macOS, and only for compiler-backed diagnostics. On Windows the compiler runs natively. Without it you still get the full native diagnostic suite.
+
+No Creation Kit, game install, or editor extension is needed. The vanilla script sources, `PapyrusCompiler.exe`, and the flags file are all fetched into the repo by `npm run fetch-vanilla`.
 
 ## Installation
 
@@ -20,37 +21,53 @@ Or install from source:
 git clone https://github.com/0xra0/Papyrus-Lsp
 cd papyrus-lsp
 npm install -g . --prefix ~/.local
+npm run fetch-vanilla   # vanilla .psc sources + PapyrusCompiler.exe
+npm run rebuild-db      # cache the type index (optional; see below)
 ```
 
 After installation the `papyrus-lsp` binary is available in your PATH.
 
 ## Configuration
 
-Drop a `.papyrus-lsp.json` file in your workspace root to override defaults:
+The server works with no configuration. Each setting is resolved independently — first hit wins:
+
+1. `.papyrus-lsp.json`, searched from the workspace root **upward**
+2. `PAPYRUS_LSP_*` environment variables
+3. The layout under `gameRoot`, if one is given
+4. The copies bundled with this install
+
+A configured path that doesn't exist is reported and skipped, falling through to the next source rather than silently disabling the feature that needed it.
 
 ```json
 {
-  "importDirs": [
-    "/path/to/vanilla-scripts/Source",
-    "/path/to/your-mod/Scripts/Source"
-  ],
+  "importDirs": ["./scripts/source", "/path/to/another-mod/Scripts/Source"],
   "compilerPath": "/path/to/PapyrusCompiler.exe",
-  "flagsFile": "/path/to/Starfield_Papyrus_Flags.flg"
+  "flagsFile": "/path/to/Starfield_Papyrus_Flags.flg",
+  "gameRoot": "~/.steam/steam/steamapps/common/Starfield"
 }
 ```
 
-All fields are optional. Omitted keys fall back to the baked-in defaults. The server re-reads the config on restart.
+All fields are optional. Relative paths resolve against the config file's own directory, and `~` expands to your home directory. The workspace root, the bundled `mod-extenders/`, and (unless another import dir already supplies `ScriptObject.psc`) the bundled vanilla sources are always appended to `importDirs`.
+
+| Environment variable | Overrides |
+|---|---|
+| `PAPYRUS_LSP_IMPORTS` | `importDirs` (`PATH`-style separated list) |
+| `PAPYRUS_LSP_COMPILER` | `compilerPath` |
+| `PAPYRUS_LSP_FLAGS` | `flagsFile` |
+| `PAPYRUS_LSP_GAME_ROOT` | `gameRoot` |
+| `PAPYRUS_LSP_MONO` | path to the `mono` binary |
 
 ## Scripts database
 
-The bundled `scripts-db.json` covers Starfield vanilla scripts. To rebuild it for your own installation, or to add a different game's scripts:
+`scripts-db.json` is a **cache, not a requirement**. If it's absent or corrupt the server indexes the sources in `importDirs` directly at startup (~250ms for 5,000 scripts) and logs how to cache it. Rebuild it with:
 
 ```bash
-# Edit DIRS in scripts/build-db.js to point at your .psc source directories
-npm run rebuild-db
+npm run rebuild-db                        # bundled vanilla + mod-extenders
+npm run rebuild-db -- /path/a /path/b     # explicit source dirs
+PAPYRUS_LSP_IMPORTS=/path/a:/path/b npm run rebuild-db
 ```
 
-The rebuild takes a few seconds and overwrites `scripts-db.json`.
+The server watches the file and hot-reloads it when it changes, so a rebuild takes effect without a restart. Scripts in your workspace are layered on top of the cache at startup, so your own types resolve without rebuilding.
 
 ## Claude Code setup
 
@@ -85,7 +102,7 @@ Live, two-tier diagnostics modeled on clangd: fast checks appear as you type, th
 
 - **Instant native suite** — parser errors, missing returns, type mismatches, structural/access checks, unused imports and locals; published on **every keystroke** with no compiler required
 - **Compiler-backed diagnostics** — full semantic checking via `PapyrusCompiler.exe -noasm`, run in the background (debounced 600ms) and again on save; compiler results supersede native ones on the same line
-- **Live-editing guarantees** — every `publishDiagnostics` carries the document version; a late compiler result never overwrites a newer edit (stale-guarding); an in-flight `mono` run is cancelled when you edit again, so runs never pile up
+- **Live-editing guarantees** — every `publishDiagnostics` carries the document version; a late compiler result never overwrites a newer edit (stale-guarding); an in-flight compiler run is cancelled when you edit again, so runs never pile up
 - **Pull diagnostics (LSP 3.17)** — advertises `diagnosticProvider` and answers `textDocument/diagnostic` and `workspace/diagnostic`, in addition to pushing via `publishDiagnostics` (the same both-ways model clangd uses). This is what lets editors and headless clients like Claude Code report "Found N new diagnostic issues in M files" after an edit. Push and pull share a per-version cache so an edit never runs the compiler twice, and pull-capable clients are asked to refresh dependents when a file's errors change.
 - **Workspace-wide check** — run `papyrus.checkAllScripts` from the command palette to compile every `.psc` in the workspace
 - **Code actions** — "Did you mean X?" suggestions and "Add import Y" quick-fixes

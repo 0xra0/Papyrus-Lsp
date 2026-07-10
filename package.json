@@ -26,6 +26,7 @@
     "build": "tsc",
     "watch": "tsc -watch",
     "postinstall": "npm run build",
+    "fetch-vanilla": "node scripts/fetch-vanilla.js",
     "rebuild-db": "node scripts/build-db.js",
     "test": "node tests/integration.test.js"
   },

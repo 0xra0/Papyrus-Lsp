@@ -431,62 +431,6 @@ function readPscDocstring(lines: string[], startIdx: number): string | undefined
   return parts.filter(Boolean).join('\n') || undefined;
 }
 
-function scanPscFile(filePath: string): void {
-  try {
-    const text  = fs.readFileSync(filePath, 'utf8');
-    const lines = text.split(/\r?\n/);
-    const len   = lines.length;
-    let sname: string | null = null;
-    let extendsType: string | null = null;
-    const functions: string[] = [];
-    const events: string[] = [];
-    const properties: Array<{ type: string; name: string }> = [];
-    for (let i = 0; i < len; i++) {
-      const raw  = lines[i];
-      const line = raw.replace(/;.*$/, '').trim();
-      if (!line || line.startsWith('{')) continue;
-      if (!sname) {
-        const m = SCRIPTNAME_RE.exec(line);
-        if (m) {
-          sname = m[1]; extendsType = m[2] ?? null;
-          const d = readPscDocstring(lines, i + 1);
-          if (d) scriptDocDb.set(sname.toLowerCase(), d);
-          continue;
-        }
-      }
-      const fm = FUNC_RE.exec(line);
-      if (fm) {
-        functions.push(`${fm[1] ?? 'void'} ${fm[2]}(${(fm[3] ?? '').trim()})`);
-        if (sname) {
-          const d = readPscDocstring(lines, i + 1);
-          if (d) funcDocDb.set(`${sname.toLowerCase()}.${fm[2].toLowerCase()}`, d);
-        }
-        continue;
-      }
-      const em = EVENT_RE.exec(line);
-      if (em) {
-        events.push(`Event ${em[1]}(${(em[2] ?? '').trim()})`);
-        if (sname) {
-          const d = readPscDocstring(lines, i + 1);
-          if (d) funcDocDb.set(`${sname.toLowerCase()}.${em[1].toLowerCase()}`, d);
-        }
-        continue;
-      }
-      const pm = PROP_RE.exec(line);
-      if (pm) {
-        properties.push({ type: pm[1], name: pm[2] });
-        if (sname) {
-          const d = readPscDocstring(lines, i + 1);
-          if (d) propDocDb.set(`${sname.toLowerCase()}.${pm[2].toLowerCase()}`, d);
-        }
-      }
-    }
-    if (sname) {
-      scriptDb.set(sname.toLowerCase(), { name: sname, extendsType, functions, events, properties, structs: [], globals: [], customEvents: [], sourcePath: filePath, funcAccess: new Map() });
-    }
-  } catch { /* skip unreadable files */ }
-}
-
 /** Parse an open document and upsert it into scriptDb/structDb so other files see it immediately. */
 function indexDocument(doc: TextDocument): void {
   typeMapCache.delete(doc.uri);
@@ -577,27 +521,170 @@ function indexDocument(doc: TextDocument): void {
   }
 }
 
-function scanPscDir(dir: string): void {
-  try {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const e of entries) {
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) scanPscDir(full);
-      else if (e.isFile() && e.name.toLowerCase().endsWith('.psc')) scanPscFile(full);
-    }
-  } catch { /* skip inaccessible dirs */ }
+// ── Runtime configuration ─────────────────────────────────────────────────────
+//
+// The server is self-contained: the vanilla script sources, the Papyrus compiler,
+// and the flags file all ship under INSTALL_ROOT. No Creation Kit, game install,
+// or editor extension is required. Each setting resolves independently, first
+// hit wins:
+//
+//   1. `.papyrus-lsp.json` — searched from the workspace root upward
+//   2. PAPYRUS_LSP_* environment variables
+//   3. A game install, when one is named via `gameRoot`
+//   4. The copies bundled with this install
+//
+// A configured path that doesn't exist is dropped rather than honoured, so a
+// stale entry degrades to the bundled default instead of silently disabling the
+// compiler — which is what a dangling `flagsFile` used to do.
+
+const INSTALL_ROOT      = path.join(__dirname, '..');
+const BUNDLED_VANILLA   = path.join(INSTALL_ROOT, '_vanilla-sf-scripts', 'Scripts', 'Source');
+const BUNDLED_COMPILER  = path.join(INSTALL_ROOT, '_vanilla-sf-scripts', 'bin', 'PapyrusCompiler', 'PapyrusCompiler.exe');
+const BUNDLED_FLAGS     = path.join(BUNDLED_VANILLA, 'Starfield_Papyrus_Flags.flg');
+const MOD_EXTENDERS_DIR = path.join(INSTALL_ROOT, 'mod-extenders');
+const SCRIPTS_DB_PATH   = path.join(INSTALL_ROOT, 'scripts-db.json');
+const FLAGS_BASENAME    = 'Starfield_Papyrus_Flags.flg';
+
+const exists = (p: string | null | undefined): p is string => !!p && fs.existsSync(p);
+
+/** First path in `cands` that exists on disk, or null. */
+function firstExisting(...cands: Array<string | null | undefined>): string | null {
+  for (const c of cands) if (exists(c)) return c;
+  return null;
 }
 
-// Runtime config — defaults baked in, overridden by .papyrus-lsp.json at startup
-const cfg = {
-  scanDirs: [
-    '/mnt/ssd/StarfieldCK/Tools/VSCodePapyrusAddon/starfield-vanilla-scripts/Source',
-    '/mnt/ssd/Starfield.Digital.Premium.Edition-InsaneRamZes/Data/Scripts',
-    '/mnt/ssd/Starfield.Digital.Premium.Edition-InsaneRamZes/Data/Data/Source/Scripts',
-  ] as string[],
-  compilerExe: '/mnt/ssd/StarfieldCK/Tools/Papyrus Compiler/PapyrusCompiler.exe',
-  flagsFile:   '/mnt/ssd/StarfieldCK/Tools/VSCodePapyrusAddon/starfield-vanilla-scripts/Source/Starfield_Papyrus_Flags.flg',
+/** Expand a leading `~`, then resolve a relative path against `base`. */
+function resolvePath(p: string, base: string): string {
+  const raw = p.trim();
+  const expanded = (raw === '~' || raw.startsWith('~/')) ? path.join(os.homedir(), raw.slice(1)) : raw;
+  return path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(base, expanded);
+}
+
+/** Does this directory supply the base game types? Cheap proxy: ScriptObject, the root of
+ *  every Papyrus inheritance chain. Case-insensitive — .psc casing varies across dumps. */
+function suppliesBaseTypes(dir: string): boolean {
+  try {
+    return fs.readdirSync(dir).some(f => f.toLowerCase() === 'scriptobject.psc');
+  } catch { return false; }
+}
+
+interface PapyrusConfig {
+  scanDirs: string[];
+  compilerExe: string | null;
+  flagsFile: string | null;
+}
+
+const cfg: PapyrusConfig = {
+  scanDirs:    [BUNDLED_VANILLA].filter(exists),
+  compilerExe: firstExisting(BUNDLED_COMPILER),
+  flagsFile:   firstExisting(BUNDLED_FLAGS),
 };
+
+/** Nearest `.papyrus-lsp.json` at `startDir` or any ancestor. */
+function findConfigFile(startDir: string): string | null {
+  let dir = path.resolve(startDir);
+  for (;;) {
+    const candidate = path.join(dir, '.papyrus-lsp.json');
+    if (exists(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/** Populate `cfg` from config file → env → gameRoot → bundled defaults.
+ *  `root` is the workspace root, or null when the client sent none. */
+function resolveConfig(root: string | null): void {
+  let file: Record<string, unknown> = {};
+  // Paths inside a config file are relative to that file, not to the cwd.
+  let base = root ?? INSTALL_ROOT;
+
+  const cfgFile = root ? findConfigFile(root) : null;
+  if (cfgFile) {
+    try {
+      file = JSON.parse(fs.readFileSync(cfgFile, 'utf8')) as Record<string, unknown>;
+      base = path.dirname(cfgFile);
+      connection.console.log(`[papyrus-lsp] config: ${cfgFile}`);
+    } catch (err) {
+      connection.console.warn(`[papyrus-lsp] ignoring unparsable ${cfgFile}: ${err}`);
+      file = {};
+    }
+  }
+
+  const env = process.env;
+  const fromFile = (key: string): string | null =>
+    typeof file[key] === 'string' ? resolvePath(file[key] as string, base) : null;
+  const fromEnv = (key: string): string | null =>
+    env[key] ? resolvePath(env[key]!, base) : null;
+
+  // A game install we can derive the stock layout from.
+  const gameRoot     = firstExisting(fromFile('gameRoot'), fromEnv('PAPYRUS_LSP_GAME_ROOT'));
+  const gameSrc      = gameRoot ? path.join(gameRoot, 'Data', 'Scripts', 'Source') : null;
+  const gameCompiler = gameRoot ? path.join(gameRoot, 'Tools', 'Papyrus Compiler', 'PapyrusCompiler.exe') : null;
+
+  // ── import dirs ──
+  const requested: string[] =
+    Array.isArray(file.importDirs) ? (file.importDirs as unknown[]).map(d => resolvePath(String(d), base))
+    : env.PAPYRUS_LSP_IMPORTS      ? env.PAPYRUS_LSP_IMPORTS.split(path.delimiter).filter(Boolean).map(d => resolvePath(d, base))
+    : [gameSrc, BUNDLED_VANILLA].filter((d): d is string => !!d);
+
+  const dirs: string[] = [];
+  const add = (d: string | null | undefined) => { if (exists(d) && !dirs.includes(d)) dirs.push(d); };
+
+  for (const d of requested) {
+    if (exists(d)) add(d);
+    else connection.console.warn(`[papyrus-lsp] import dir not found, skipping: ${d}`);
+  }
+  add(root);              // the workspace's own scripts are always importable
+  add(MOD_EXTENDERS_DIR); // and so are the bundled extender stubs
+  // Guarantee the base game types resolve. Only appended when nothing else supplies
+  // them, so a user pointing at their own vanilla dump doesn't get it twice.
+  if (!dirs.some(suppliesBaseTypes)) add(BUNDLED_VANILLA);
+  cfg.scanDirs = dirs;
+
+  cfg.compilerExe = firstExisting(
+    fromFile('compilerPath'), fromEnv('PAPYRUS_LSP_COMPILER'), gameCompiler, BUNDLED_COMPILER,
+  );
+
+  // The flags file normally sits alongside the sources it governs, so prefer a copy
+  // from the import dirs before falling back to the bundled one.
+  cfg.flagsFile = firstExisting(
+    fromFile('flagsFile'), fromEnv('PAPYRUS_LSP_FLAGS'),
+    ...cfg.scanDirs.map(d => path.join(d, FLAGS_BASENAME)),
+    BUNDLED_FLAGS,
+  );
+
+  refreshCompilerReady();
+}
+
+// ── Compiler runner ───────────────────────────────────────────────────────────
+//
+// PapyrusCompiler.exe is a .NET assembly: it runs natively on Windows and needs a
+// CLR shim everywhere else. Resolved once — it cannot change while we run.
+
+const monoExe: string | null = (() => {
+  if (process.platform === 'win32') return null; // runs natively, no shim
+  const override = process.env.PAPYRUS_LSP_MONO;
+  if (override) return exists(override) ? override : null;
+  try {
+    const { execSync } = require('child_process') as typeof import('child_process');
+    return execSync('command -v mono', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null;
+  } catch { return null; }
+})();
+
+/** True when compiler-augmented diagnostics can actually run. */
+let compilerReady = false;
+function refreshCompilerReady(): void {
+  compilerReady = !!(cfg.compilerExe && cfg.flagsFile && (process.platform === 'win32' || monoExe));
+}
+
+/** Build the argv for a compiler run, or null if it can't be run on this machine. */
+function compilerArgv(args: string[]): { cmd: string; argv: string[] } | null {
+  if (!compilerReady || !cfg.compilerExe) return null;
+  return process.platform === 'win32'
+    ? { cmd: cfg.compilerExe, argv: args }
+    : { cmd: monoExe!, argv: [cfg.compilerExe, ...args] };
+}
 
 // ── Papyrus block-structure parser ────────────────────────────────────────────
 
@@ -1313,15 +1400,70 @@ function buildScriptHoverMd(chain: ScriptInfo[], prefix = ''): string {
 
 // ── LSP ───────────────────────────────────────────────────────────────────────
 
+/** Rebuild the lookup indexes derived from scriptDb/structDb. Idempotent. */
+function buildDerivedIndexes(): void {
+  eventNameSet.clear(); globalFuncDb.clear(); structNameIndex.clear();
+
+  for (const info of scriptDb.values()) {
+    for (const ev of info.events) {
+      const m = /^Event\s+([\w.]+)/i.exec(ev);
+      if (m) { const parts = m[1].split('.'); eventNameSet.add(parts[parts.length - 1]); }
+    }
+    for (const ce of info.customEvents) eventNameSet.add(ce);
+    for (const g of info.globals) { if (!globalFuncDb.has(g)) globalFuncDb.set(g, info); }
+  }
+  // Reverse index: unqualified struct name → [qualified keys...]
+  for (const key of structDb.keys()) {
+    const sName = key.slice(key.lastIndexOf(':') + 1);
+    if (!structNameIndex.has(sName)) structNameIndex.set(sName, []);
+    structNameIndex.get(sName)!.push(key);
+  }
+}
+
+/** Parse every .psc under `dirs` straight into scriptDb — the same data
+ *  scripts-db.json holds, derived on the spot. Later dirs override earlier ones. */
+function scanScriptDbFromSources(dirs: string[]): number {
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.isFile() && e.name.toLowerCase().endsWith('.psc')) files.push(full);
+    }
+  };
+  for (const dir of dirs) walk(dir);
+
+  for (const f of files) {
+    try {
+      indexDocument(TextDocument.create(`file://${f}`, 'papyrus', 0, fs.readFileSync(f, 'utf8')));
+    } catch { /* skip unreadable files */ }
+  }
+  return files.length;
+}
+
+/** Populate scriptDb from the pre-built cache, falling back to a source scan.
+ *  The cache is an optimisation, never a requirement. */
 function loadScriptDb(dbPath: string): void {
   scriptDb.clear(); structDb.clear(); structNameIndex.clear(); funcDocDb.clear();
   propDocDb.clear(); scriptDocDb.clear(); globalFuncDb.clear(); eventNameSet.clear();
   typeMapCache.clear();
 
-  if (!fs.existsSync(dbPath)) {
-    connection.console.warn('[papyrus-lsp] scripts-db.json not found — run scripts/build-db.js first');
-    return;
-  }
+  const rebuildFromSources = (why: string): void => {
+    const started = Date.now();
+    // Drop anything a half-parsed cache left behind before re-deriving.
+    scriptDb.clear(); structDb.clear(); funcDocDb.clear(); propDocDb.clear(); scriptDocDb.clear();
+    const n = scanScriptDbFromSources(cfg.scanDirs);
+    buildDerivedIndexes();
+    connection.console.log(
+      `[papyrus-lsp] ${why} — indexed ${n} scripts from source in ${Date.now() - started}ms. ` +
+      `Run \`npm run rebuild-db\` in ${INSTALL_ROOT} to cache this and cut startup time.`
+    );
+  };
+
+  // The source scan already covers cfg.scanDirs, workspace included.
+  if (!exists(dbPath)) { rebuildFromSources('no scripts-db.json'); return; }
   try {
     const raw = JSON.parse(fs.readFileSync(dbPath, 'utf8')) as Record<string, any>;
     for (const [k, v] of Object.entries(raw)) {
@@ -1360,23 +1502,20 @@ function loadScriptDb(dbPath: string): void {
       for (const p of (v.properties ?? []))
         if (p.doc) propDocDb.set(`${k}.${String(p.name).toLowerCase()}`, p.doc);
     }
-    for (const info of scriptDb.values()) {
-      for (const ev of info.events) {
-        const m = /^Event\s+([\w.]+)/i.exec(ev);
-        if (m) { const parts = m[1].split('.'); eventNameSet.add(parts[parts.length - 1]); }
-      }
-      for (const ce of info.customEvents) eventNameSet.add(ce);
-      for (const g of info.globals) { if (!globalFuncDb.has(g)) globalFuncDb.set(g, info); }
-    }
-    // Build reverse index: unqualified struct name → [qualified keys...]
-    for (const key of structDb.keys()) {
-      const sName = key.slice(key.lastIndexOf(':') + 1);
-      if (!structNameIndex.has(sName)) structNameIndex.set(sName, []);
-      structNameIndex.get(sName)!.push(key);
-    }
-    connection.console.log(`[papyrus-lsp] loaded ${scriptDb.size} scripts, ${structDb.size} structs from scripts-db.json`);
+    // The cache only knows the dirs build-db.js was pointed at. Layer the dirs it
+    // can't have seen — the workspace, and anything else configured — on top, so a
+    // project's own scripts resolve without rebuilding the cache first.
+    const cached = scriptDb.size;
+    const overlaid = scanScriptDbFromSources(cfg.scanDirs.filter(d => d !== BUNDLED_VANILLA));
+    buildDerivedIndexes();
+    connection.console.log(
+      `[papyrus-lsp] loaded ${cached} scripts from scripts-db.json, ` +
+      `overlaid ${overlaid} from source — ${scriptDb.size} total, ${structDb.size} structs`
+    );
   } catch (err) {
-    connection.console.warn(`[papyrus-lsp] failed to load scripts-db.json: ${err}`);
+    // A corrupt cache shouldn't cost us hover/completions — derive the data instead.
+    connection.console.warn(`[papyrus-lsp] scripts-db.json unreadable (${err})`);
+    rebuildFromSources('falling back to a source scan');
   }
 }
 
@@ -1386,24 +1525,11 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
 
   // Store workspace root for later (batch diagnostics, etc.)
   const rootUri = params.rootUri ?? (params.workspaceFolders?.[0]?.uri ?? null);
-  if (rootUri) {
-    workspaceRoot = rootUri.replace(/^file:\/\//, '');
-    const cfgFile = path.join(workspaceRoot, '.papyrus-lsp.json');
-    if (fs.existsSync(cfgFile)) {
-      try {
-        const userCfg = JSON.parse(fs.readFileSync(cfgFile, 'utf8'));
-        if (Array.isArray(userCfg.importDirs))  cfg.scanDirs    = userCfg.importDirs;
-        if (typeof userCfg.compilerPath === 'string') cfg.compilerExe = userCfg.compilerPath;
-        if (typeof userCfg.flagsFile    === 'string') cfg.flagsFile   = userCfg.flagsFile;
-        connection.console.log(`[papyrus-lsp] loaded config from ${cfgFile}`);
-      } catch (err) {
-        connection.console.warn(`[papyrus-lsp] failed to parse .papyrus-lsp.json: ${err}`);
-      }
-    }
-  }
+  if (rootUri) workspaceRoot = decodeURIComponent(rootUri.replace(/^file:\/\//, ''));
 
-  // Load pre-built scripts-db.json
-  loadScriptDb(path.join(__dirname, '..', 'scripts-db.json'));
+  // Must precede loadScriptDb: the on-the-fly fallback scans cfg.scanDirs.
+  resolveConfig(workspaceRoot);
+  loadScriptDb(SCRIPTS_DB_PATH);
 
   return {
     capabilities: {
@@ -1516,10 +1642,7 @@ async function buildRefIndex(): Promise<void> {
   }
 
   const allPaths: string[] = [];
-  const scanTargets = [...cfg.scanDirs];
-  const modExtDir = path.join(__dirname, '..', 'mod-extenders');
-  if (fs.existsSync(modExtDir) && !scanTargets.includes(modExtDir)) scanTargets.push(modExtDir);
-  for (const dir of scanTargets) collectPscPaths(dir, allPaths);
+  for (const dir of cfg.scanDirs) collectPscPaths(dir, allPaths);
 
   const CHUNK = 50;
   for (let i = 0; i < allPaths.length; i += CHUNK) {
@@ -1536,54 +1659,45 @@ async function buildRefIndex(): Promise<void> {
 // Build the index after the handshake so startup latency stays low
 // ── Startup requirement checks ────────────────────────────────────────────────
 
-function checkRequirements(): void {
-  const { execSync } = require('child_process') as typeof import('child_process');
+/** Log what the server resolved. Nothing here is fatal: the native checker covers
+ *  diagnostics without a compiler, and scriptDb is derived from source without a cache. */
+function reportResolvedSetup(): void {
+  connection.console.log(`[papyrus-lsp] import dirs: ${cfg.scanDirs.join(', ') || '(none)'}`);
 
-  // mono + compiler — optional; native checker handles diagnostics without them
-  const monoOk = (() => { try { execSync('which mono', { stdio: 'ignore' }); return true; } catch { return false; } })();
-  const compilerOk = fs.existsSync(cfg.compilerExe);
-  const flagsOk    = fs.existsSync(cfg.flagsFile);
-
-  if (!monoOk || !compilerOk || !flagsOk) {
-    const missing: string[] = [];
-    if (!monoOk)     missing.push('mono not in PATH');
-    if (!compilerOk) missing.push(`PapyrusCompiler.exe not found (${cfg.compilerExe})`);
-    if (!flagsOk)    missing.push(`flags file not found (${cfg.flagsFile})`);
-    connection.console.log(
-      `[papyrus-lsp] Compiler-augmented diagnostics unavailable (${missing.join('; ')}) — using native checker only.`
-    );
-  } else {
-    connection.console.log('[papyrus-lsp] PapyrusCompiler.exe available — compiler-augmented diagnostics enabled.');
+  if (compilerReady) {
+    const via = process.platform === 'win32' ? 'native' : `mono ${monoExe}`;
+    connection.console.log(`[papyrus-lsp] compiler diagnostics enabled — ${cfg.compilerExe} (${via})`);
+    return;
   }
 
-  // scripts-db.json — required for hover/completions/definitions
-  const dbPath = path.join(__dirname, '..', 'scripts-db.json');
-  if (!fs.existsSync(dbPath)) {
-    connection.console.warn('[papyrus-lsp] scripts-db.json not found — run `node scripts/build-db.js` inside papyrus-lsp/.');
-    connection.window.showWarningMessage(
-      'Papyrus LSP: scripts-db.json not found — hover, completions, and definitions will not work. Run `node scripts/build-db.js`.'
-    );
-  }
+  const missing: string[] = [];
+  if (!cfg.compilerExe) missing.push('PapyrusCompiler.exe not found');
+  if (!cfg.flagsFile)   missing.push(`no ${FLAGS_BASENAME} in any import dir`);
+  if (process.platform !== 'win32' && !monoExe) missing.push('mono not in PATH (set PAPYRUS_LSP_MONO)');
+  connection.console.log(
+    `[papyrus-lsp] compiler diagnostics unavailable (${missing.join('; ')}) — native checker only.`
+  );
 }
 
 connection.onInitialized(() => {
-  checkRequirements();
+  reportResolvedSetup();
   setImmediate(buildRefIndex);
 
-  // Hot-reload scripts-db.json when it changes on disk (e.g. after rebuild-db)
-  const dbPath = path.join(__dirname, '..', 'scripts-db.json');
-  if (fs.existsSync(dbPath)) {
+  // Hot-reload the cache when it appears or changes (e.g. after `npm run rebuild-db`).
+  // Watch the directory, not the file: the file may not exist yet.
+  try {
     let reloadTimer: ReturnType<typeof setTimeout> | null = null;
-    fs.watch(dbPath, { persistent: false }, () => {
+    fs.watch(INSTALL_ROOT, { persistent: false }, (_evt, filename) => {
+      if (filename !== path.basename(SCRIPTS_DB_PATH)) return;
       if (reloadTimer) clearTimeout(reloadTimer);
       reloadTimer = setTimeout(() => {
         reloadTimer = null;
         connection.console.log('[papyrus-lsp] scripts-db.json changed — reloading…');
-        loadScriptDb(dbPath);
+        loadScriptDb(SCRIPTS_DB_PATH);
         connection.window.showInformationMessage('[papyrus-lsp] Papyrus script database reloaded.');
       }, 500);
     });
-  }
+  } catch { /* watching is a nicety; a failed watch must not break the session */ }
 });
 
 // ── Compiler-backed diagnostics ───────────────────────────────────────────────
@@ -1619,21 +1733,21 @@ function collectCompilerDiags(doc: TextDocument, cb: (diags: Diagnostic[]) => vo
     cb([]); return null;
   }
 
-  const modExtendersDir = path.join(__dirname, '..', 'mod-extenders');
-  const allImportDirs = [...cfg.scanDirs];
-  if (fs.existsSync(modExtendersDir) && !allImportDirs.includes(modExtendersDir))
-    allImportDirs.push(modExtendersDir);
-  const importStr = allImportDirs.join(';');
-  const args = [
-    cfg.compilerExe, tempFile,
-    `-import=${importStr}`,
+  // `;` is PapyrusCompiler's own list separator, not the platform's.
+  const run = compilerArgv([
+    tempFile,
+    `-import=${cfg.scanDirs.join(';')}`,
     `-flags=${cfg.flagsFile}`,
     '-noasm',
     `-output=${runDir}`,
     '-quiet',
-  ];
+  ]);
+  if (!run) {
+    try { fs.rmSync(runDir, { recursive: true, force: true }); } catch {}
+    cb([]); return null;
+  }
 
-  return execFile('mono', args, { timeout: 15000 }, (_err, stdout, stderr) => {
+  return execFile(run.cmd, run.argv, { timeout: 15000 }, (_err, stdout, stderr) => {
     try { fs.rmSync(runDir, { recursive: true, force: true }); } catch {}
 
     const output = stdout + stderr;
@@ -2656,7 +2770,7 @@ function checkSemantics(doc: TextDocument): Diagnostic[] {
 /** Run the fast native diagnostic suite (parser + semantic checks). No compiler, no I/O spawn. */
 function computeNativeDiagnostics(doc: TextDocument): Diagnostic[] {
   const text = doc.getText();
-  const compilerAvailable = fs.existsSync(cfg.compilerExe) && fs.existsSync(cfg.flagsFile);
+  const compilerAvailable = compilerReady;
 
   // Native suite always runs — provides immediate feedback and works without the compiler.
   // checkSemantics is included only when the compiler is absent; the compiler supersedes
@@ -2711,7 +2825,7 @@ function computeDiagnostics(doc: TextDocument): Promise<Diagnostic[]> {
 
   indexDocument(doc);
   const native = computeNativeDiagnostics(doc);
-  const compilerAvailable = fs.existsSync(cfg.compilerExe) && fs.existsSync(cfg.flagsFile);
+  const compilerAvailable = compilerReady;
 
   if (!compilerAvailable) {
     diagCache.set(doc.uri, { version: doc.version, diags: native, final: true });
@@ -2743,7 +2857,7 @@ function publishNative(doc: TextDocument): Diagnostic[] {
   indexDocument(doc);
   const native = computeNativeDiagnostics(doc);
   // Native is the final word only when there's no compiler to refine it.
-  const compilerAvailable = fs.existsSync(cfg.compilerExe) && fs.existsSync(cfg.flagsFile);
+  const compilerAvailable = compilerReady;
   diagCache.set(doc.uri, { version: doc.version, diags: native, final: !compilerAvailable });
   connection.sendDiagnostics({ uri: doc.uri, version: doc.version, diagnostics: native });
   return native;
@@ -2752,7 +2866,7 @@ function publishNative(doc: TextDocument): Diagnostic[] {
 /** Run the compiler in the background and merge its authoritative results on top of
  *  `native`, cancelling any older run for the same file and discarding stale output. */
 function augmentWithCompiler(doc: TextDocument, native: Diagnostic[]): void {
-  if (!(fs.existsSync(cfg.compilerExe) && fs.existsSync(cfg.flagsFile))) return;
+  if (!compilerReady) return;
   const uri = doc.uri;
   const version = doc.version;
 
@@ -3722,7 +3836,7 @@ connection.onCompletionResolve((item: CompletionItem): CompletionItem => {
 connection.onExecuteCommand((params) => {
   if (params.command !== 'papyrus.checkAllScripts') return;
   if (!workspaceRoot) { connection.window.showWarningMessage('[papyrus-lsp] No workspace root'); return; }
-  if (!fs.existsSync(cfg.compilerExe) || !fs.existsSync(cfg.flagsFile)) {
+  if (!compilerReady) {
     connection.window.showWarningMessage('[papyrus-lsp] Compiler not configured'); return;
   }
 

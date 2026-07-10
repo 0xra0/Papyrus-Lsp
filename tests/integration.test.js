@@ -27,10 +27,16 @@ const path = require('path');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const ROOT       = path.resolve(__dirname, '..');
-const SERVER_BIN = path.join(ROOT, 'dist', 'server.js');
-const FIXTURE    = '/mnt/ssd/StarfieldCK/Tools/VSCodePapyrusAddon/starfield-vanilla-scripts/Source/LC088_KeyQuestScript.psc';
-const WORKSPACE  = path.dirname(FIXTURE);
+const ROOT        = path.resolve(__dirname, '..');
+const SERVER_BIN  = path.join(ROOT, 'dist', 'server.js');
+const VANILLA_SRC = path.join(ROOT, '_vanilla-sf-scripts', 'Scripts', 'Source');
+const FIXTURE     = path.join(VANILLA_SRC, 'LC088_KeyQuestScript.psc');
+const WORKSPACE   = path.dirname(FIXTURE);
+
+if (!fs.existsSync(FIXTURE)) {
+  console.error(`Fixture missing: ${FIXTURE}\nRun \`npm run fetch-vanilla\` to download the vanilla scripts.`);
+  process.exit(1);
+}
 
 // ── Line-lookup helpers ───────────────────────────────────────────────────────
 

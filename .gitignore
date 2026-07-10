@@ -3,3 +3,7 @@ dist/
 *.js.map
 scripts-db.json
 .env
+
+# Fetched by `npm run fetch-vanilla` — vanilla .psc sources + PapyrusCompiler.exe.
+# Its own git checkout; never commit it into this one.
+_vanilla-sf-scripts/
