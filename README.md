@@ -11,21 +11,19 @@ No Creation Kit, game install, or editor extension is needed. The vanilla script
 
 ## Installation
 
-```bash
-npm install -g papyrus-lsp
-```
-
-Or install from source:
+Not yet published to npm — install from source:
 
 ```bash
 git clone https://github.com/0xra0/Papyrus-Lsp
-cd papyrus-lsp
-npm install -g . --prefix ~/.local
-npm run fetch-vanilla   # vanilla .psc sources + PapyrusCompiler.exe
-npm run rebuild-db      # cache the type index (optional; see below)
+cd Papyrus-Lsp
+npm install -g . --prefix ~/.local   # builds, and puts papyrus-lsp on your PATH
+npm run fetch-vanilla                # vanilla .psc sources + PapyrusCompiler.exe
+npm run rebuild-db                   # optional — cache the type index
 ```
 
 After installation the `papyrus-lsp` binary is available in your PATH.
+
+The server locates its bundled compiler and vanilla sources relative to its own install directory. `npm install -g .` links this clone, so fetching into the clone is enough. If you instead install a **packed** copy, note that `_vanilla-sf-scripts/` is excluded from the `files` whitelist and won't be present: run `fetch-vanilla` from inside the install directory, or point `compilerPath` and `importDirs` at copies you already have.
 
 ## Configuration
 
@@ -69,6 +67,17 @@ PAPYRUS_LSP_IMPORTS=/path/a:/path/b npm run rebuild-db
 
 The server watches the file and hot-reloads it when it changes, so a rebuild takes effect without a restart. Scripts in your workspace are layered on top of the cache at startup, so your own types resolve without rebuilding.
 
+## Troubleshooting
+
+The server logs what it resolved at startup. Check your editor's LSP log for:
+
+```
+[papyrus-lsp] import dirs: /path/to/vanilla/Source, /your/workspace, ...
+[papyrus-lsp] compiler diagnostics enabled — /path/to/PapyrusCompiler.exe (mono /usr/bin/mono)
+```
+
+If you instead see `compiler diagnostics unavailable (...)`, the message names what's missing. Only the native suite runs in that mode: you'll still get parser, structural, and access errors on every keystroke, but **not** full type and event checking — so a bad cast or an unknown event name will go unreported. Set the missing path via `.papyrus-lsp.json` or the matching `PAPYRUS_LSP_*` variable.
+
 ## Claude Code setup
 
 Add to your Claude Code LSP plugin config (`.lsp.json`):
@@ -94,7 +103,7 @@ Add to your Claude Code LSP plugin config (`.lsp.json`):
 ### Navigation
 - **Go-to-definition** — F12 on type names, variables, struct types (`Script:Struct`)
 - **Find references** — Shift+F12 shows all `.psc` files that reference a type
-- **Workspace symbols** — Ctrl+T fuzzy-searches all 4,755+ script names
+- **Workspace symbols** — Ctrl+T fuzzy-searches all 5,000+ script names
 - **Document symbols** — Ctrl+Shift+O outline of functions, events, properties, structs, custom events
 
 ### Diagnostics
