@@ -67,6 +67,27 @@ PAPYRUS_LSP_IMPORTS=/path/a:/path/b npm run rebuild-db
 
 The server watches the file and hot-reloads it when it changes, so a rebuild takes effect without a restart. Scripts in your workspace are layered on top of the cache at startup, so your own types resolve without rebuilding.
 
+## Command line
+
+`papyrus-check` runs the same diagnostics headlessly, for CI and pre-commit hooks. It drives the very server your editor talks to, so its results match what you see while typing.
+
+```bash
+papyrus-check Scripts/Source              # a directory, searched recursively
+papyrus-check MyScript.psc --strict       # fail on warnings too
+papyrus-check Scripts/Source --json       # machine-readable
+papyrus-check MyScript.psc --verbose      # show which compiler and import dirs were used
+```
+
+```
+MyScript.psc
+  16:68    error  OnLocationChange is not an event on scriptobject or one if its parents
+  43:11    warn   Call to DebugOnly function 'Notification' will be removed in release builds
+
+1 error, 1 warning
+```
+
+Exit status is `0` when clean, `1` when diagnostics are found (warnings only count with `--strict`), and `2` on bad usage or a server failure. Files are checked four at a time, and each result already includes the compiler-backed pass — there is no polling or debounce to wait out.
+
 ## Troubleshooting
 
 The server logs what it resolved at startup. Check your editor's LSP log for:

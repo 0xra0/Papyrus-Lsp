@@ -694,14 +694,42 @@ interface RawDiag {
 }
 interface BlockEntry { keyword: string; line: number; col: number; }
 
-function stripLineComment(raw: string): string {
+/**
+ * Blank out everything on a line that isn't code: `;` comments, `{...}` docstrings,
+ * and the contents of string literals.
+ *
+ * All three must be recognised in one pass, because each can contain the others'
+ * delimiters: a `;` inside a docstring is not a comment, a `{` inside a comment does
+ * not open a docstring, and a keyword inside a string is not a keyword. That last one
+ * matters because the block parser reads bare tokens — without this,
+ * `Debug.Trace("Idle State Begin")` opens a `State` block that is never closed.
+ *
+ * Papyrus has no brace-delimited blocks, so a `{` outside a string always opens a
+ * docstring, which may run to a `}` several lines later.
+ *
+ * Non-code is replaced with spaces rather than removed, so diagnostic columns still
+ * line up with the original source.
+ */
+function stripLineComment(raw: string, inDoc = false): { text: string; inDoc: boolean } {
+  const out = raw.split('');
   let inStr = false;
   for (let i = 0; i < raw.length; i++) {
     const c = raw[i];
-    if (c === '"' && raw[i - 1] !== '\\') inStr = !inStr;
-    if (!inStr && c === ';') return raw.slice(0, i);
+    if (inDoc) {
+      out[i] = ' ';
+      if (c === '}') inDoc = false;
+      continue;
+    }
+    if (inStr) {
+      out[i] = ' ';
+      if (c === '"' && raw[i - 1] !== '\\') inStr = false;
+      continue;
+    }
+    if (c === '"') { out[i] = ' '; inStr = true; continue; }
+    if (c === ';') { for (let j = i; j < raw.length; j++) out[j] = ' '; break; }
+    if (c === '{') { out[i] = ' '; inDoc = true; }
   }
-  return raw;
+  return { text: out.join(''), inDoc };
 }
 
 function parsePapyrus(text: string): RawDiag[] {
@@ -710,10 +738,21 @@ function parsePapyrus(text: string): RawDiag[] {
   const stack: BlockEntry[] = [];
   let hasScriptName = false;
   let inBlockComment = false;
+  let inDocstring = false;
 
+  // `Guard <name>` is a declaration, not a block: there is no EndGuard keyword.
+  // TryLockGuard is a block, and — like If — it takes an optional Else branch.
+  // LockGuard/EndLockGuard is left to checkGuards(), which tracks it in detail.
   const OPEN_TO_CLOSE: Record<string, string> = {
     function: 'endfunction', event: 'endevent', state: 'endstate',
-    struct: 'endstruct', group: 'endgroup', if: 'endif', while: 'endwhile', guard: 'endguard',
+    struct: 'endstruct', group: 'endgroup', if: 'endif', while: 'endwhile',
+    trylockguard: 'endtrylockguard',
+  };
+  // Canonical casing for messages; derived names like "Endtrylockguard" read badly.
+  const CLOSER_LABEL: Record<string, string> = {
+    function: 'EndFunction', event: 'EndEvent', state: 'EndState', struct: 'EndStruct',
+    group: 'EndGroup', if: 'EndIf', while: 'EndWhile', property: 'EndProperty',
+    trylockguard: 'EndTryLockGuard',
   };
   const CLOSERS = new Set(Object.values(OPEN_TO_CLOSE));
   const CLOSE_TO_OPEN: Record<string, string> = Object.fromEntries(
@@ -721,30 +760,53 @@ function parsePapyrus(text: string): RawDiag[] {
   );
   CLOSE_TO_OPEN['endproperty'] = 'property';
 
+  // Pass 1 — reduce each physical line to its code, blanking `;/ /;` block comments,
+  // `;` comments, {docstrings}, and string contents. Columns are preserved.
+  const code: string[] = [];
   for (let i = 0; i < lines.length; i++) {
     let raw = lines[i];
 
-    // Handle ;/ block comment /;
     if (inBlockComment) {
       const ci = raw.indexOf('/;');
-      if (ci !== -1) { inBlockComment = false; raw = raw.slice(ci + 2); }
-      else continue;
+      if (ci !== -1) { inBlockComment = false; raw = ' '.repeat(ci + 2) + raw.slice(ci + 2); }
+      else { code.push(''); continue; }
     }
     const bo = raw.indexOf(';/');
     if (bo !== -1) {
       const bc = raw.indexOf('/;', bo + 2);
-      if (bc !== -1) { raw = raw.slice(0, bo) + raw.slice(bc + 2); }
+      if (bc !== -1) raw = raw.slice(0, bo) + ' '.repeat(bc + 2 - bo) + raw.slice(bc + 2);
       else { inBlockComment = true; raw = raw.slice(0, bo); }
     }
 
-    const stripped = stripLineComment(raw);
-    const trimmed = stripped.trim();
-    if (!trimmed) continue;
+    const scan = stripLineComment(raw, inDocstring);
+    inDocstring = scan.inDoc;
+    code.push(scan.text);
+  }
 
+  // Pass 2 — a trailing `\` continues a statement on the next line. Merge those into
+  // one logical statement, keeping the first physical line for diagnostics. Without
+  // this, `Function Foo(a, \` … `b) native` loses its `native` flag and looks unclosed.
+  // Pass 1 already blanked strings and comments, so a `\` seen here is always real.
+  const statements: Array<{ text: string; line: number }> = [];
+  for (let i = 0; i < code.length; i++) {
+    if (!code[i].trim()) continue;
+    const line = i;
+    let text = code[i];
+    while (text.trimEnd().endsWith('\\') && i + 1 < code.length) {
+      text = text.trimEnd().slice(0, -1) + ' ' + code[++i].trim();
+    }
+    statements.push({ text, line });
+  }
+
+  for (const { text: stripped, line: i } of statements) {
+    const trimmed = stripped.trim();
     const tokens = trimmed.split(/\s+/);
     const t0 = tokens[0];
-    // Handle "if(cond)" / "while(cond)" / "elseif(cond)" without a space before "("
-    const t0l = (t0.match(/^([a-zA-Z]+)\(/) ? t0.match(/^([a-zA-Z]+)/)![1] : t0).toLowerCase();
+    // A keyword may run straight into punctuation: "if(cond)", "if!(cond)", "while(x)".
+    // Split on the first non-identifier char, so `if!(` yields `if` while identifiers
+    // such as `iflag` or `if_x` stay whole and are not mistaken for keywords.
+    const kwMatch = /^([a-zA-Z]+)(?![a-zA-Z0-9_])/.exec(t0);
+    const t0l = (kwMatch ? kwMatch[1] : t0).toLowerCase();
     const colStart = stripped.length - stripped.trimStart().length;
 
     // ScriptName
@@ -797,12 +859,14 @@ function parsePapyrus(text: string): RawDiag[] {
       handleCloser(t0l, CLOSE_TO_OPEN[t0l], t0, i, colStart, trimmed.length, stack, diags); continue;
     }
 
-    // ElseIf / Else must be inside If
+    // Else belongs to an If or a TryLockGuard; ElseIf only to an If.
     if (t0l === 'elseif' || t0l === 'else') {
       const top = stack.length ? stack[stack.length - 1] : null;
-      if (!top || top.keyword !== 'if') {
+      const hosts = t0l === 'else' ? ['if', 'trylockguard'] : ['if'];
+      if (!top || !hosts.includes(top.keyword)) {
+        const where = t0l === 'else' ? 'an If or TryLockGuard block' : 'an If block';
         diags.push({ line: i, startChar: colStart, endChar: colStart + t0.length,
-          severity: DiagnosticSeverity.Error, message: `'${t0}' used outside of an If block.` });
+          severity: DiagnosticSeverity.Error, message: `'${t0}' used outside of ${where}.` });
       }
       continue;
     }
@@ -810,7 +874,8 @@ function parsePapyrus(text: string): RawDiag[] {
 
   // Unclosed blocks
   for (const entry of stack) {
-    const closer = 'End' + entry.keyword[0].toUpperCase() + entry.keyword.slice(1);
+    const closer = CLOSER_LABEL[entry.keyword]
+      ?? 'End' + entry.keyword[0].toUpperCase() + entry.keyword.slice(1);
     diags.push({ line: entry.line, startChar: entry.col,
       endChar: entry.col + (lines[entry.line]?.trimStart().length ?? 1),
       severity: DiagnosticSeverity.Error,
