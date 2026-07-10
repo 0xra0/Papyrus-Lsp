@@ -11,6 +11,10 @@ Scriptname CassiopeiaPapyrusExtender native hidden
    ; # ( returns how many actors have the perk on function end )
 Int Function AddPerkToAll(Actor[] akActors, Perk akPerk) native global
    ;
+   ; # returns true if animation processing is disabled for this actor
+   ; # ( see PauseAnimations and ResumeAnimations for more info )
+Bool Function AreAnimationsPaused(Actor akActor) native global
+   ;
    ; # returns true if there's at least one hostile within the given distance
    ; # ( hostality is checked against akActor; requires akActor and the hostiles to be 3D loaded )
 Bool Function AreHostileActorsNearCustom(Actor akActor, float afDistance) native global
@@ -127,14 +131,17 @@ MagicEffect[] Function GetMagicEffects(Actor akActor) native global
    ; # returns the movement state ( values > 0.0 means the actor is moving )
 Float Function GetMovementState(Actor akActor) native global
    ;
+   ; # returns the Perk Rank
+   ; # ( valid Perk Rank values: 1 - 4 )
+   ; # ( returns 0 if akActor doesn't have akPerk )
+   ; # ( returns -1 if akActor or akPerk is None )
+Int Function GetPerkRank(Actor akActor, Perk akPerk) native global
+   ;
    ; # returns the Perks of this actor
 Perk[] Function GetPerks(Actor akActor) native global
    ;
    ; # returns this actor's sex ( 0 = male, 1 = female, -1 = non binary )
 Int Function GetSex(Actor akActor) native global
-   ;
-   ; # returns the skin tone index ( 0 - 8 )
-Int Function GetSkinTone(Actor akActor) native global
    ;
    ; # returns the speaking Anim Face Archetype
 Keyword Function GetSpeakingAnimArchetype(Actor akActor) native global
@@ -230,6 +237,12 @@ Bool Function Jump(Actor akActor, Float afJumpHeight = -1.0) native global
    ; # moves all actors to their Package Location
 Bool Function MoveAllToPackageLocation(Actor[] akActors) native global
    ;
+   ; # pauses animation processing for this actor
+   ; # ( note that it doesn't pause AI processing; e.g. if the actor was walking when PauseAnimations was called, upon calling ResumeAnimations, they'd "teleport" to the spot where they would have walked to if animation processing wasn't disabled; call EnableAI(False) to pause AI too, if needed )
+   ; # ( note that animation processing gets reenabled for all actors OnPlayerLoadGame )
+   ; # ( see AreAnimationsPaused and ResumeAnimations )
+Bool Function PauseAnimations(Actor akActor) native global
+   ;
    ; # navigates this actor to the given coordinate
 Bool Function PathToPoint(Actor akActor, float afXPos, float afYPos, float afZPos) native global
    ;
@@ -240,11 +253,10 @@ Bool Function PlayIdleNoConditions(Idle akIdle, Actor akActor, ObjectReference a
    ; # removes this Perk from these actors; returns how many actors does not have the perk on function end
 Int Function RemovePerkFromAll(Actor[] akActors, Perk akPerk) native global
    ;
-   ; # restores this actor's vanilla appearance
-   ; # ( returns false of akActor is None or if both bool parameters are false )
-   ; # ( does not update the actor's appearance after calling it; the player has to exit then reload as the vanilla appearance data needs to be loaded from the actor's source plugin )
-   ; # ( use with care; avoid calling it on actors with templated appearance )
-Bool Function RestoreAppearance(Actor akActor, Bool abFacialAppearance = true, Bool abBodyScale = true) native global
+   ; # resumes animation processing for this actor
+   ; # ( returns -1 on error; returns 0 if animation processing was not disabled and is running; returns 1 if animation processing was disabled but has been reenabled )
+   ; # ( see AreAnimationsPaused and PauseAnimations )
+Int Function ResumeAnimations(Actor akActor) native global
    ;
    ; # rotates this actor ( with turning movement animations, often seen when initiating a dialogue )
    ; # ( e.g. to ask the actor to face the player: RotateActor(akActor, akActor.GetAngleZ() + akActor.GetHeadingAngle(akTarget), 0.0) )
@@ -274,20 +286,11 @@ Function SetHelmetLight(Actor akActor, bool abOn) native global
    ; # sets the loaded ammo count to the given value
 Bool Function SetLoadedAmmoCount(Actor akActor, Int aiAmmoCount, Int aiEquipIndex = 0) native global
    ;
-   ; # changes the skin tone index ( 0 - 8 )
-Bool Function SetSkinTone(Actor akActor, int aiSkinToneIndex) native global
-   ;
    ; # forces this actor to stop moving ( normally, i.e. doesn't freeze the actor )
 Bool Function StopMovement(Actor akActor) native global
    ;
    ; # unequips all items (Weapons and Armors) from this actor and returns how many items were unequipped
 Int Function UnequipAllThenUpdate3D(Actor akActor) native global
-   ;
-   ; # updates the full appearance of this actor
-Bool Function UpdateAppearance(Actor akActor, int aiUpdateFlags = 0x28, bool abTreatAsRaceChange = false) native global
-   ;
-   ; # updates the chargen ( facial ) appearance of this actor
-Bool Function UpdateChargenAppearance(Actor akActor) native global
 
 
 
@@ -349,6 +352,164 @@ Bool Function GetCellLoaded(Cell akCell) native global
 
 
 
+   ; ##### CharGen & FaceGen Utils #####
+   ;
+   ;
+   ; ### CharGen ###
+   ;
+   ; # CharGen ( character appearance ) data is technically ActorBase data as per vanilla design.
+   ; # Which means, any changes to an actor's appearance are written to their appearance source actor base form.
+   ; # To identify the appearance source actor base, call GetAppearanceSource().
+   ; # Note that appearance changes are stored in save games ( see RestoreAppearance to restore the vanilla appearance ).
+   ; # The "Set" functions such as SetHairColor don't reload CharGen data ( so they don't update appearance upon calling them ). Either update it with UpdateAppearance or reload the Actor's 3D ( e.g. Disable-Enable ).
+   ;
+   ;
+   ; # Note that UpdateAppearance doesn't update facial tints ( such as makeup ). If facial tints look off after calling UpdateAppearance, call UpdateSkinTone ~0.2-0.5 AI update seconds after, e.g.:
+   ;
+   ; Function SetHairColorDirtyBlonde(Actor akActor)
+   ; 	 SetHairColor(akActor, "DirtyBlonde")				; set hair color
+   ; 	 UpdateAppearance(akActor)						; reload chargen data
+   ; 	 Float fAITime = GetAIUpdateTimer()				; get AI Update time
+   ; 	 While ( fAITime + 0.5 >= GetAIUpdateTimer() )		; wait for native code to update AI processing for all actors for at least 0.5 seconds ( should be enough for the vanilla code to complete UpdateAppearance )
+   ; 	 	Utility.Wait(0.10)
+   ; 	 EndWhile
+   ; 	 UpdateSkinTone(akActor)						; once chargen data is reloaded and appearance is updated, update the skin tone
+   ; EndFunction
+   ;
+   ; Function SetEyeColorBlue(Actor akActor)
+   ; 	 SetEyeColor(akActor, "Blue")						; set eye color
+   ; 	 UpdateSkinTone(akActor)						; eye color can be updated by UpdateSkinTone, see below
+   ; EndFunction
+   ;
+   ;
+String Function GetEyebrowColor(Actor akActor) native global
+String Function GetEyeColor(Actor akActor) native global
+String Function GetFacialHairColor(Actor akActor) native global
+String Function GetHairColor(Actor akActor) native global
+String Function GetJewelryColor(Actor akActor) native global
+String Function GetTeethColor(Actor akActor) native global
+   ;
+Bool Function SetEyebrowColor(Actor akActor, String asColor) native global
+Bool Function SetEyeColor(Actor akActor, String asColor) native global
+Bool Function SetFacialHairColor(Actor akActor, String asColor) native global
+Bool Function SetHairColor(Actor akActor, String asColor) native global
+Bool Function SetJewelryColor(Actor akActor, String asColor) native global
+Bool Function SetTeethColor(Actor akActor, String asColor) native global
+   ;
+   ;
+   ;
+   ; ### CharGen Misc. ###
+   ;
+   ; # returns the Body Weight values ( Thin, Muscular, Heavy ) in a 3-element float array
+Float[] Function GetBodyWeight(Actor akActor) native global
+   ;
+   ; # returns the skin tone index ( 0 - 8 )
+Int Function GetSkinTone(Actor akActor) native global
+   ;
+   ; # updates the full appearance
+   ; # ( note that this is demanding )
+Bool Function UpdateAppearance(Actor akActor, int aiUpdateFlags = 0x28, bool abTreatAsRaceChange = false) native global
+   ;
+   ; # updates the chargen ( facial ) appearance
+Bool Function UpdateChargenAppearance(Actor akActor) native global
+   ;
+   ; # updates the Skin Tone ( including facial tints, makeup ) and eye color
+Bool Function UpdateSkinTone(Actor akActor) native global
+   ;
+   ; # restores vanilla appearance
+   ; # ( returns false if akActor is None or if both bool parameters are false )
+   ; # ( does not reload the actor's vanilla appearance data from their Source Plugin .esm after calling it; only after the game is reopened )
+   ; # ( use with care; avoid calling it on actors with templated appearance )
+Bool Function RestoreAppearance(Actor akActor, Bool abFacialAppearance = true, Bool abBodyScale = true) native global
+   ;
+   ; # sets Body Weight values
+Bool Function SetBodyWeight(Actor akActor, Float afThin, Float afMuscular, Float afHeavy) native global
+   ;
+   ; # sets Body Weight values ( array version; afBodyWeightValues must have 3 elements: Thin, Muscular, Heavy )
+Bool Function SetBodyWeightFromArray(Actor akActor, Float[] afBodyWeightValues) native global
+   ;
+   ; # changes the skin tone index ( 0 - 8 )
+   ; # ( no need to call UpdateSkinTone afterward, it applies the new Skin Tone immediatelly )
+Bool Function SetSkinTone(Actor akActor, int aiSkinToneIndex) native global
+   ;
+   ;
+   ;
+   ; ### FaceGen ###
+   ;
+   ; # FaceGen refers to the vanilla game systems that construct facial data and manage facial animations.
+   ; # Overriding facial morphs with the FaceGen functions below such as ApplyFacialExpression don't change actor appearance permanently ( unlike the CharGen functions above ). They are temporal overrides.
+   ; # Temporal, because the vanilla animation system would immediatelly continue to run the actor's vanilla animations ( usually their Anim Archetype and Anim Face Archetype ).
+   ; # To prevent this, PauseAnimations must be called before overriding facial expression or morphs. See PauseAnimations, ResumeAnimations and AreAnimationsPaused.
+   ; # For reference, to queue a new facial animation to play, see the anim face archetype modifier functions like SetFaceAnimArchetype ( from Cassiopeia ) and ChangeAnimFaceArchetype ( vanilla Actor.psc ).
+   ;
+   ;
+   ; To change an actor's facial expression to "Apologetic" for ~5 seconds:
+   ;
+   ; Function SetApologetic(Actor akActor) Global
+   ; 	Form facialExpression_Apologetic = Game.GetFormFromFile(0x0020D3A3, "Starfield.esm")	; get the vanilla facial expression form
+   ; 	PauseAnimations(akActor)														; pause animation processing for the NPC
+   ; 	ApplyFacialExpression(akActor, facialExpression_Apologetic)							; apply the facial expression form
+   ; 	Utility.Wait(5.0)																; keep the applied expression for ~5 seconds
+   ; 	ResumeAnimations(akActor)														; reenable animation processing; vanilla code will continue to run the actor's vanilla animations ( and restore their previous facial expression )
+   ; EndFunction
+   ;
+   ;
+   ; To change an actor's facial animation to the "Apologetic" Anim Archetype without adding the archetype keyword:
+   ;
+   ; Function SetApologeticFaceAnimArchetype(Actor akActor) Global
+   ; 	Keyword AnimFaceArchetypeApologetic = Game.GetFormFromFile(0x00118A4D, "Starfield.esm")
+   ; 	SetFaceAnimArchetype(akActor, AnimFaceArchetypeApologetic)
+   ; EndFunction
+   ;
+   ;
+   ; To change an actor's facial animation to the "Apologetic" Anim Archetype with adding the archetype keyword:
+   ;
+   ; Function SetApologeticFaceAnimArchetypeVANILLA(Actor akActor) Global
+   ; 	Keyword AnimFaceArchetypeApologetic = Game.GetFormFromFile(0x00118A4D, "Starfield.esm")
+   ; 	akActor.ChangeAnimFaceArchetype(AnimFaceArchetypeApologetic)
+   ; EndFunction
+   ;
+   ;
+   ;
+   ; # applies a facial expression form ( its all morphs ) to an actor
+Bool Function ApplyFacialExpression(Actor akActor, Form akFacialExpressionData) native global
+   ;
+   ; # copies the facial expression from an actor to another
+Bool Function CopyFacialExpression(Actor akSourceActor, Actor akTargetActor) native global
+   ;
+   ; # exports all facial morphs to a txt file ( in the EXE folder ). You can use this function to see all facial morphs names.
+Bool Function ExportMorphMap(Actor akActor) native global
+   ;
+   ; # get a single morph value
+Float Function GetMorphValue(Actor akActor, String asMorphName) native global
+   ;
+   ; # get multiple morph values ( an actor has 100 expression related facial morphs )
+Float[] Function GetMorphValues(Actor akActor) native global
+   ;
+   ; # reads this Facial Expression Data form's all morphs values and names ( arrays have the same size )
+String[] Function ReadFacialExpressionDataMorphNames(Form akFacialExpressionData) native global
+Float[] Function ReadFacialExpressionDataMorphValues(Form akFacialExpressionData) native global
+   ;
+   ; # reads a single morph value
+Float Function ReadMorphValue(Form akFacialExpressionData, String asMorphName) native global
+   ;
+   ; # sets all facial morphs to 0 ( i.e. to "neutral" face )
+Bool Function ResetFacialExpression(Actor akActor) native global
+   ;
+   ; # set a single morph value
+Bool Function SetMorphValue(Actor akActor, String asMorphName, float afValue) native global
+   ;
+   ; # set multiple morph values
+Bool Function SetMorphValues(Actor akActor, String[] asMorphNames, float[] afValues) native global
+   ;
+   ; # all facial morphs of this actor will be written to this Facial Expression Data form
+Bool Function StoreFacialExpression(Actor akActor, Form akFacialExpressionData) native global
+   ;
+   ; # writes a single morph value
+Bool Function WriteMorphValue(Form akFacialExpressionData, String asMorphName, float afValue) native global
+
+
+
    ; ##### Console #####
    ;
    ; # clears the Console log
@@ -388,44 +549,7 @@ Bool Function UnregisterForNativeEvent(String asScriptName, String asEventName) 
 
 
 
-   ; ##### FaceGen #####
-   ;
-   ; # applies the facial expression (all morphs) from a Facial Expression Data form to an actor
-Bool Function ApplyFacialExpression(Actor akActor, Form akFacialExpressionData) native global
-   ;
-   ; # copies the facial expression from an actor to another
-Bool Function CopyFacialExpression(Actor akSourceActor, Actor akTargetActor) native global
-   ;
-   ; # exports all facial morphs to a txt file ( in the EXE folder ). You can use this function to see all facial morphs names.
-Bool Function ExportMorphMap(Actor akActor) native global
-   ;
-   ; # get a single morph value
-Float Function GetMorphValue(Actor akActor, String asMorphName) native global
-   ;
-   ; # get multiple morph values ( an actor has 100 expression related facial morphs )
-Float[] Function GetMorphValues(Actor akActor) native global
-   ;
-   ; # reads this Facial Expression Data form's all morphs values and names ( arrays have the same size )
-String[] Function ReadFacialExpressionDataMorphNames(Form akFacialExpressionData) native global
-Float[] Function ReadFacialExpressionDataMorphValues(Form akFacialExpressionData) native global
-   ;
-   ; # reads a single morph value
-Float Function ReadMorphValue(Form akFacialExpressionData, String asMorphName) native global
-   ;
-   ; # sets all facial morphs to 0 ( i.e. to "neutral" face )
-Bool Function ResetFacialExpression(Actor akActor) native global
-   ;
-   ; # set a single morph value
-Bool Function SetMorphValue(Actor akActor, String asMorphName, float afValue) native global
-   ;
-   ; # set multiple morph values
-Bool Function SetMorphValues(Actor akActor, String[] asMorphNames, float[] afValues) native global
-   ;
-   ; # all facial morphs of this actor will be written to this Facial Expression Data form
-Bool Function StoreFacialExpression(Actor akActor, Form akFacialExpressionData) native global
-   ;
-   ; # writes a single morph value
-Bool Function WriteMorphValue(Form akFacialExpressionData, String asMorphName, float afValue) native global
+
 
 
 
@@ -561,9 +685,8 @@ Function DisablePlayerLandVehiclePlacement(Bool abDisable) native global
    ; # enables/disables distant LOD objects
 Bool Function EnableDistantLOD(bool abEnable) native global
    ;
-   ; # returns the angle between this reference and the camera's heading in degrees - in the range from -180 to 180
-   ; # ( it is basically akReference.GetHeadingAngle(WorldCamera), i.e. the reverse of vanilla Game.GetCameraHeadingAngle() )
-Float Function GetReferenceCameraHeadingAngle(ObjectReference akReference) native global
+   ; # returns the seconds passed after save game load ( note: it does not tick while in menu mode )
+Float Function GetAIUpdateTimer() native global
    ;
    ; # returns the Console selected reference
 ObjectReference Function GetConsoleRef() native global
@@ -639,6 +762,10 @@ Int Function GetPlayerSpaceshipWeaponCapacity(int aiWeaponIndex) native global
    ;
    ; # returns the weapon type of the player's ship as string ( e.g. MSL, LAS )
 String Function GetPlayerSpaceshipWeaponType(int aiWeaponIndex) native global
+   ;
+   ; # returns the angle between this reference and the camera's heading in degrees - in the range from -180 to 180
+   ; # ( it is basically akReference.GetHeadingAngle(WorldCamera), i.e. the reverse of vanilla Game.GetCameraHeadingAngle() )
+Float Function GetReferenceCameraHeadingAngle(ObjectReference akReference) native global
    ;
    ; # returns the total Reference Handle count
 Int Function GetReferenceHandleCount() native global
@@ -871,6 +998,10 @@ ObjectReference Function GetNthItemReference(ObjectReference akReference, Int ai
 Float Function GetNthItemDamageResistanceElectromagnetic(ObjectReference akReference, int aiItemIndex, int aiStack) native global
 Float Function GetNthItemDamageResistanceEnergy(ObjectReference akReference, int aiItemIndex, int aiStack) native global
 Float Function GetNthItemDamageResistancePhysical(ObjectReference akReference, int aiItemIndex, int aiStack) native global
+   ;
+   ; # returns the total weight of all worn ( equipped ) Weapon and Armor inventory items
+   ; # ( akItemFilter is optional; if not empty, the code will only count items that have any of the filter keywords )
+Float Function GetWornItemsWeight(Actor akActor, Bool abCalcWeapons, Bool abCalcArmors, Keyword[] akItemFilter = None) native global
    ;
    ; # returns true if the Nth item is equip state locked ( i.e. equipped with abPreventRemoval = true )
 Bool Function IsNthItemEquipStateLocked(Actor akActor, Int aiItemIndex) native global
@@ -1106,6 +1237,9 @@ Bool Function MoveAllToEditorLocation(ObjectReference[] akReferences) native glo
    ; # renames this Outpost Beacon or Decorate activator reference
 Bool Function RenameOutpost(ObjectReference akReference, String asName) native global
    ;
+   ; # removes this Outpost
+Bool Function RemoveOutpost(ObjectReference akOutpostReference) native global
+   ;
    ; # resets this reference's inventory
 Bool Function ResetInventory(ObjectReference akReference, bool abLeveledOnly, bool abSkipDefaultOutfit) native global
    ;
@@ -1228,6 +1362,17 @@ Bool Function IsSmallMaster(String asPluginName) native global
    ; # clears all Quest Aliases
 Bool Function ClearAllAliases(Quest akQuest) native global
    ;
+   ; # returns true if the Quest Stage Item with the specified IDs has the Complete Quest flag
+   ; # ( auiItemID = -1 means "return true if any of the Quest Stage Items of the Quest Stage has this flag )
+Bool Function CompletesQuest(Quest akQuest, Int auiStageID, Int auiItemID = -1) native global
+   ;
+   ; # returns true if the Quest Stage Item with the specified IDs has the Fail Quest flag
+   ; # ( auiItemID = -1 means "return true if any of the Quest Stage Items of the Quest Stage has this flag )
+Bool Function FailsQuest(Quest akQuest, Int auiStageID, Int auiItemID = -1) native global
+   ;
+   ; # returns the number of Quest Stage Items the Quest Stage with the specified ID has
+Int Function GetQuestStageItemCount(Quest akQuest, Int auiStageID) native global
+   ;
    ; # returns all running quests
 Quest[] Function GetAllRunningQuests() native global
    ;
@@ -1236,6 +1381,12 @@ Topic[] Function GetAllTopicsByOwnerQuest(Quest akQuest) native global
    ;
    ; # returns true if this quest is flagged as failed
 Bool Function IsQuestFailed(Quest akQuest) native global
+   ;
+   ; # returns true if the Quest Stage with the specified ID has the Run on Start flag
+Bool Function IsRunOnStartStage(Quest akQuest, Int auiStageID) native global
+   ;
+   ; # returns true if the Quest Stage with the specified ID has the Run on Stop flag
+Bool Function IsRunOnStopStage(Quest akQuest, Int auiStageID) native global
    ;
    ; # sets/unsets this quest's failed flag
    ; # ( returns true if the operation was attempted )

@@ -1,55 +1,73 @@
 ; CassiopeiaPapyrusExtender - native event callback signatures
-; Source: CassiopeiaPapyrusEvents_v8.1.txt by LarannKiar
+; Source: CassiopeiaPapyrusEvents.txt (Cassiopeia Papyrus Extender 9.4) by LarannKiar
 ; Global callback functions scripts must define to receive native events.
 ; Register with: RegisterForNativeEvent("ScriptName", "EventName")
+;
+; Declared `global native` so the signatures resolve without a body. In your own
+; script you implement them as ordinary `global` functions.
 
 Scriptname CassiopeiaPapyrusEvents native hidden
 
 
 ; ##### Events with callback parameters #####
 
-; Events ( with EventData ) ##### when this actor equips / unequips something akFilter support: can be filtered by akSource
+; when this actor equips / unequips something
+; akFilter support: can be filtered by akSource
 Function TESEquipEvent(Actor akSource, Int akItemBaseID, bool abEquipped) global native
 
-; sent when this cell gets fully loaded has akFilter support
+; sent when this cell gets fully loaded
+; has akFilter support
 Function TESCellFullyLoadedEvent(Cell akCell) global native
 
-; sent when a reference Activates another has akFilter support ( code checks for both the activated and the action references, disjunctive )
+; sent when a reference Activates another
+; has akFilter support ( code checks for both the activated and the action references, disjunctive )
 Function TESActivateEvent(ObjectReference akActivatedRef, ObjectReference akActionRef) global native
 
-; workshop events have akFilter support ( code checks for both itemRef and workshopRef, disjunctive )
+; workshop events
+; have akFilter support ( code checks for both itemRef and workshopRef, disjunctive )
 Function Workshop_ItemGrabbedEvent(ObjectReference itemRef, ObjectReference workshopRef) global native
 
 Function Workshop_ItemMovedEvent(ObjectReference itemRef, ObjectReference workshopRef) global native
 
 Function Workshop_ItemPlacedEvent(ObjectReference itemRef, ObjectReference workshopRef) global native
 
-; input event ( aiKeyCode is Virtual-Key Code, see https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes )
+; input event
+; ( aiKeyCode is Virtual-Key Code, see https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes )
 Function BSInputEvent(Int aiKeyCode, String asControlName, String asFriendlyName, bool bPressed, Float afHeldTime) global native
 
-; sent when the player selects a system or planet to travel to in the GalaxyStarMapMenu ( similar to the vanilla actor event OnPlayerFailedPlotRoute() ) aeFailedPlotReason: see Actor.psc afDistance: measured in light years sent when the player clicks OK to close the TextInputMenu
+; sent when the player clicks OK to close the TextInputMenu
 Function TextInputMenu_EndEditText(String sInputText) global native
 
-; when this form is deleted note that scripts must be previously filtered for the deleted form to receive this event
+; when this form is deleted
+; note that scripts must be previously filtered for the deleted form to receive this event
 Function TESFormDeleteEvent(Int aiDeletedFormID) global native
 
-; when this reference is loaded / unloaded has akFilter support
+; when this reference is loaded / unloaded
+; has akFilter support
 Function TESObjectLoadedEvent(ObjectReference akReference, bool abLoaded) global native
 
-; sent when this actor changes their ParentCell has akFilter support ( code can check for the actor and the cells, disjunctive )
+; sent when this actor changes their ParentCell
+; has akFilter support ( code can check for the actor and the cells, disjunctive )
 Function ActorCellChangeEvent(Actor akActor, Cell akPreviousCell, Cell akCurrentCell) global native
 
-; when this reference's 3D is attached has akFilter support ( code can check its GetBaseObject() too, disjunctive )
+; when this reference's 3D is attached
+; has akFilter support ( code can check its GetBaseObject() too, disjunctive )
 Function ReferenceSet3d(ObjectReference akReference) global native
 
 ; when this location is loaded
 Function BGSLocationLoadedEvent(Location akLocation) global native
 
-; when this actor enters/exits a furniture has akFilter support ( code can check both akActor and akFurniture, disjunctive )
+; when this actor enters/exits a furniture
+; has akFilter support ( code can check both akActor and akFurniture, disjunctive )
 Function TESFurnitureEvent(Actor akActor, ObjectReference akFurniture, Bool abExiting) global native
 
-; when an actor Harvests a Flora reference has akFilter support ( code can check akActor, akHarvestedReference and akProduceForm as well, disjunctive )
+; when an actor Harvests a Flora reference
+; has akFilter support ( code can check akActor, akHarvestedReference and akProduceForm as well, disjunctive )
 Function TESHarvestEvent(Actor akActor, ObjectReference akHarvestedReference, Form akProduceForm) global native
+
+; when this Outpost is removed
+; has akFilter support ( code can check akOutpostCell, akOutpostLocation and akOutpostWorldSpace as well, disjunctive )
+Function RemoveOutpostEvent(Cell akOutpostCell, Location akOutpostLocation, WorldSpace akOutpostWorldSpace) global native
 
 
 ; ##### Events with no callback parameters #####
