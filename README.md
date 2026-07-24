@@ -139,8 +139,9 @@ Add to your Claude Code LSP plugin config (`.lsp.json`):
 
 ### Navigation
 - **Go-to-definition** — F12 on type names, variables, struct types (`Script:Struct`)
-- **Find references** — Shift+F12 shows all `.psc` files that reference a type
-- **Workspace symbols** — Ctrl+T fuzzy-searches all 5,000+ script names
+- **Go-to-implementation** — Ctrl+F12 on a script name lists every script extending it; on a function, event, or property it lists every override, resolved from the original declaration so an override finds its siblings
+- **Find references** — Shift+F12 on a type, function, event, or property. Member results are filtered to the declaring type, so `PlayAnimation` on your script does not return every unrelated script declaring one of its own
+- **Workspace symbols** — Ctrl+T fuzzy-searches script names plus their functions, events, properties, and structs, each pointing at its declaration line
 - **Document symbols** — Ctrl+Shift+O outline of functions, events, properties, structs, custom events
 
 ### Diagnostics
@@ -156,7 +157,7 @@ Live, two-tier diagnostics modeled on clangd: fast checks appear as you type, th
 ### Intelligence
 - **Hover** — type info, doc comments, struct fields, self/parent, chained calls (`Game.GetPlayer().`)
 - **Type hierarchy** — Shift+Alt+H shows parent/child type tree
-- **Call hierarchy** — incoming and outgoing calls for any function
+- **Call hierarchy** — incoming and outgoing calls for any function, attributed to the calling function rather than the file, and filtered by receiver type so same-named members on unrelated scripts stay out
 - **Semantic tokens** — proper syntax highlighting for types, functions, properties, parameters
 - **Code lens** — reference counts above `ScriptName`, `overrides ParentType` above overridden functions
 - **Folding** — collapses Function/Event/State/If/While/Struct blocks

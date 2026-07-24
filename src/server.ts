@@ -1607,6 +1607,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       hoverProvider: true,
       signatureHelpProvider: { triggerCharacters: ['(', ','] },
       definitionProvider: true,
+      implementationProvider: true,
       workspaceSymbolProvider: true,
       referencesProvider: true,
       documentSymbolProvider: true,
@@ -1639,8 +1640,111 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
 // ── Reference index ───────────────────────────────────────────────────────────
 
 const refIndex     = new Map<string, Location[]>();
-const funcCallIndex = new Map<string, Array<{ loc: Location; scriptName: string }>>();
+
+/** One occurrence of a member name — a function, event, or property — in the sources.
+ *  Papyrus reuses names heavily (`PlayAnimation` is declared on ObjectReference and on
+ *  a dozen unrelated mod scripts), so a name match alone says nothing about whose member
+ *  was meant. Enough surrounding context is captured here to answer that at query time
+ *  without re-reading and re-parsing the file for every request. */
+interface MemberSite {
+  loc: Location;
+  /** Script the occurrence lives in. */
+  scriptName: string;
+  /** Text left of the dot (`SAFScript`, `myVar`, `Game`), or null when unqualified. */
+  receiver: string | null;
+  /** Function or event enclosing the occurrence; null on a declaration line or at script scope. */
+  enclosingFunc: string | null;
+  /** Declaration line of that enclosing function; 0 when there is none. */
+  enclosingLine: number;
+  /** True when the occurrence is a call — `name(` — rather than a plain reference. */
+  isCall: boolean;
+}
+const memberIndex = new Map<string, MemberSite[]>();
 let   refIndexReady = false;
+
+/** Is `ancestorLower` somewhere on `typeLower`'s inheritance chain (including itself)? */
+function chainHas(typeLower: string, ancestorLower: string): boolean {
+  return getInheritanceChain(typeLower).some(i => i.name.toLowerCase() === ancestorLower);
+}
+
+/** Variable/property types and Import list for a script, both needed to work out whose
+ *  member an occurrence refers to. Parsed on demand and cached: a query touches a handful
+ *  of scripts, so building this for all 5,000 up front would be wasted work. */
+const scriptCtxCache = new Map<string, { typeMap: Map<string, string>; imports: Set<string> } | null>();
+
+function scriptCtx(scriptName: string): { typeMap: Map<string, string>; imports: Set<string> } | null {
+  const key = scriptName.toLowerCase();
+  const cached = scriptCtxCache.get(key);
+  if (cached !== undefined) return cached;
+
+  const info = scriptDb.get(key);
+  let ctx: { typeMap: Map<string, string>; imports: Set<string> } | null = null;
+  if (info?.sourcePath) {
+    try {
+      const text    = fs.readFileSync(info.sourcePath, 'utf8');
+      const imports = new Set<string>();
+      for (const raw of text.split(/\r?\n/)) {
+        const im = /^\s*import\s+(\w+)/i.exec(raw.replace(/;.*$/, ''));
+        if (im) imports.add(im[1].toLowerCase());
+      }
+      ctx = { typeMap: buildTypeMap(TextDocument.create(`file://${info.sourcePath}`, 'papyrus', 0, text)), imports };
+    } catch { /* unreadable source — fall through to null */ }
+  }
+  scriptCtxCache.set(key, ctx);
+  return ctx;
+}
+
+/** Does this occurrence refer to `ownerLower`'s member, rather than a same-named member
+ *  on an unrelated type? Unresolvable receivers are dropped: a wrong jump target costs
+ *  more than a missing one. */
+function siteResolvesTo(site: MemberSite, ownerLower: string): boolean {
+  if (site.receiver) {
+    const rl = site.receiver.toLowerCase();
+    // `Owner.Member(...)` — a script name used directly, as globals and natives are called
+    if (scriptDb.has(rl)) return chainHas(rl, ownerLower);
+    const ctx = scriptCtx(site.scriptName);
+    const t   = ctx ? resolveExprType(site.receiver, ctx.typeMap) : null;
+    return t ? chainHas(t, ownerLower) : false;
+  }
+  // Unqualified: either the host script's own member, or one pulled in by Import
+  if (chainHas(site.scriptName.toLowerCase(), ownerLower)) return true;
+  return scriptCtx(site.scriptName)?.imports.has(ownerLower) ?? false;
+}
+
+/** Which type owns the member under the cursor: the receiver's type when there is one,
+ *  otherwise the enclosing script. Returns the declaring ancestor, not the leaf type. */
+function resolveMemberOwner(doc: TextDocument, line: string, wordStart: number, wl: string): string | null {
+  const typeMap = buildTypeMap(doc);
+  const recv    = wordStart > 0 && line[wordStart - 1] === '.' ? scanReceiver(line, wordStart - 1) : null;
+  const t       = recv ? resolveExprType(recv, typeMap) : typeMap.get('self');
+  if (!t) return null;
+
+  const fn = findFunctionAndOwner(t, wl);
+  if (fn) return fn.ownerLower;
+  for (const info of getInheritanceChain(t)) {
+    if (info.events.some(s => sigToName(s).toLowerCase() === wl)) return info.name.toLowerCase();
+    if (info.properties.some(p => p.name.toLowerCase() === wl))   return info.name.toLowerCase();
+  }
+  return t;
+}
+
+/** Does `info` declare `wl` itself, under any member kind? */
+function declaresMember(info: ScriptInfo, wl: string): boolean {
+  return info.functions.some(s => sigToName(s).toLowerCase() === wl)
+      || info.events.some(s => sigToName(s).toLowerCase() === wl)
+      || info.properties.some(p => p.name.toLowerCase() === wl);
+}
+
+/** The highest ancestor of `typeLower` declaring `wl`. Implementations are the overrides of
+ *  an original declaration, so an override has to resolve to the same root its siblings do —
+ *  the nearest declarer would only ever find itself. The chain runs leaf→root, so the last
+ *  declarer seen is the root-most. */
+function rootDeclarerOf(typeLower: string, wl: string): string | null {
+  let root: string | null = null;
+  for (const info of getInheritanceChain(typeLower))
+    if (declaresMember(info, wl)) root = info.name.toLowerCase();
+  return root;
+}
 
 async function buildRefIndex(): Promise<void> {
   // Show a progress notification while the background index builds
@@ -1652,12 +1756,17 @@ async function buildRefIndex(): Promise<void> {
   } catch { /* progress not supported by this client */ }
 
   const WORD_RE = /\b([A-Za-z_]\w*)\b/g;
-  const CALL_RE = /\b(\w+)\s*\(/g;
 
-  // Set of all known function names for call-index filtering
-  const allFuncNames = new Set<string>();
-  for (const info of scriptDb.values())
-    for (const sig of info.functions) { const n = sigToName(sig); if (n) allFuncNames.add(n.toLowerCase()); }
+  // Every name a member query could land on. Restricting the index to declared members
+  // keeps it to symbols that can actually resolve, rather than every identifier in the
+  // corpus — locals and parameters stay out of it.
+  const allMemberNames = new Set<string>();
+  for (const info of scriptDb.values()) {
+    for (const sig of info.functions) { const n = sigToName(sig); if (n) allMemberNames.add(n.toLowerCase()); }
+    for (const sig of info.events)    { const n = sigToName(sig); if (n) allMemberNames.add(n.toLowerCase()); }
+    for (const p  of info.properties) allMemberNames.add(p.name.toLowerCase());
+    for (const ce of info.customEvents) allMemberNames.add(ce.toLowerCase());
+  }
 
   function indexFile(filePath: string): void {
     const scriptName = path.basename(filePath, '.psc');
@@ -1665,8 +1774,43 @@ async function buildRefIndex(): Promise<void> {
     try { text = fs.readFileSync(filePath, 'utf8'); } catch { return; }
     const uri   = `file://${filePath}`;
     const lines = text.split(/\r?\n/);
+
+    // Declarations, located first with backslash continuations joined: FUNC_RE needs the
+    // closing paren on one line, so a wrapped signature would otherwise not register as
+    // opening a body, and its calls would be credited to the function above it.
+    const declAt   = new Map<number, { name: string; native: boolean }>();
+    const declSpan = new Set<number>();
+    for (let i = 0; i < lines.length; i++) {
+      const startLine = i;
+      let s = lines[i].replace(/;.*$/, '').trim();
+      while (/\\$/.test(s) && i + 1 < lines.length)
+        s = `${s.slice(0, -1).trim()} ${lines[++i].replace(/;.*$/, '').trim()}`;
+      const dfm = FUNC_RE.exec(s);
+      const dem = dfm ? null : EVENT_RE.exec(s);
+      if (!dfm && !dem) continue;
+      declAt.set(startLine, { name: dfm ? dfm[2] : dem![1], native: /\bnative\b/i.test(s) });
+      for (let k = startLine; k <= i; k++) declSpan.add(k);
+    }
+
+    // Enclosing function, tracked as we descend, so each call site can be attributed to
+    // the function it sits in instead of just the file.
+    let curFunc: string | null = null;
+    let curFuncLine = 0;
+
     for (let i = 0; i < lines.length; i++) {
       const stripped = lines[i].replace(/;.*$/, '');
+      const trimmed  = stripped.trim();
+
+      const decl   = declAt.get(i);
+      const isDecl = declSpan.has(i);
+      if (decl) {
+        // Natives have no body, so nothing below them belongs to this declaration.
+        curFunc     = decl.native ? null : decl.name;
+        curFuncLine = decl.native ? 0 : i;
+      } else if (/^end(?:function|event)\b/i.test(trimmed)) {
+        curFunc = null;
+        curFuncLine = 0;
+      }
 
       // Type reference index
       WORD_RE.lastIndex = 0;
@@ -1680,16 +1824,23 @@ async function buildRefIndex(): Promise<void> {
         arr.push(loc);
       }
 
-      // Function call index — skip declaration lines to avoid false positives
-      if (FUNC_RE.test(stripped) || EVENT_RE.test(stripped)) continue;
-      CALL_RE.lastIndex = 0;
-      while ((m = CALL_RE.exec(stripped)) !== null) {
+      // Member occurrence index. Declaration lines are indexed too — "find references" on
+      // a function should surface its own signature alongside every call of it.
+      WORD_RE.lastIndex = 0;
+      while ((m = WORD_RE.exec(stripped)) !== null) {
         const lc = m[1].toLowerCase();
-        if (!allFuncNames.has(lc)) continue;
-        const callLoc = Location.create(uri, Range.create(i, m.index, i, m.index + m[1].length));
-        let carr = funcCallIndex.get(lc);
-        if (!carr) { carr = []; funcCallIndex.set(lc, carr); }
-        carr.push({ loc: callLoc, scriptName });
+        if (!allMemberNames.has(lc)) continue;
+        const dotIdx = m.index - 1;
+        let arr = memberIndex.get(lc);
+        if (!arr) { arr = []; memberIndex.set(lc, arr); }
+        arr.push({
+          loc:           Location.create(uri, Range.create(i, m.index, i, m.index + m[1].length)),
+          scriptName,
+          receiver:      dotIdx >= 0 && stripped[dotIdx] === '.' ? scanReceiver(stripped, dotIdx) || null : null,
+          enclosingFunc: isDecl ? null : curFunc,
+          enclosingLine: isDecl ? i : curFuncLine,
+          isCall:        /^\s*\(/.test(stripped.slice(m.index + m[1].length)),
+        });
       }
     }
   }
@@ -1718,7 +1869,9 @@ async function buildRefIndex(): Promise<void> {
 
   refIndexReady = true;
   reporter?.done();
-  connection.console.log(`[papyrus-lsp] reference index ready — ${refIndex.size} types indexed`);
+  connection.console.log(
+    `[papyrus-lsp] reference index ready — ${refIndex.size} types, ${memberIndex.size} members indexed`
+  );
 }
 
 // Build the index after the handshake so startup latency stays low
@@ -3608,20 +3761,36 @@ connection.onDocumentSymbol((params: DocumentSymbolParams): DocumentSymbol[] => 
 connection.onWorkspaceSymbol((params: WorkspaceSymbolParams): SymbolInformation[] => {
   const q = params.query.toLowerCase();
   const results: SymbolInformation[] = [];
+  const LIMIT = 200;
+
+  // Declaration lines are resolved per hit rather than per script: locating all of them up
+  // front would read every source file in the corpus to answer a query capped at 200 rows.
+  const at = (info: ScriptInfo, nameLower: string): Range => {
+    const ln = info.sourcePath ? findDeclarationLine(info.sourcePath, nameLower) : 0;
+    return Range.create(ln, 0, ln, 0);
+  };
 
   for (const info of scriptDb.values()) {
-    if (results.length >= 200) break;
+    if (results.length >= LIMIT) break;
+    if (!info.sourcePath) continue;
+    const uri = `file://${info.sourcePath}`;
 
-    const nameLower = info.name.toLowerCase();
-    if (q && !nameLower.includes(q)) continue;
+    if (!q || info.name.toLowerCase().includes(q))
+      results.push(SymbolInformation.create(info.name, SymbolKind.Class, at(info, info.name.toLowerCase()), uri));
 
-    const uri = info.sourcePath ? `file://${info.sourcePath}` : '';
-    results.push(SymbolInformation.create(
-      info.name,
-      SymbolKind.Class,
-      Range.create(0, 0, 0, 0),
-      uri,
-    ));
+    // An empty query lists scripts alone — folding in every member would bury them.
+    if (!q) continue;
+
+    const add = (name: string, kind: SymbolKind) => {
+      if (results.length >= LIMIT || !name.toLowerCase().includes(q)) return;
+      results.push(SymbolInformation.create(name, kind, at(info, name.toLowerCase()), uri, info.name));
+    };
+
+    for (const sig of info.functions) { const n = sigToName(sig); if (n) add(n, SymbolKind.Function); }
+    for (const sig of info.events)    { const n = sigToName(sig); if (n) add(n, SymbolKind.Event); }
+    for (const p  of info.properties) add(p.name, SymbolKind.Property);
+    for (const st of info.structs)    add(st.name, SymbolKind.Struct);
+    for (const ce of info.customEvents) add(ce, SymbolKind.Event);
   }
 
   return results;
@@ -3643,10 +3812,19 @@ connection.onReferences((params: ReferenceParams): Location[] => {
   if (!word) return [];
 
   const wl = word.toLowerCase();
-  let typeName = scriptDb.has(wl) ? wl : buildTypeMap(doc).get(wl);
-  if (!typeName) return [];
 
-  return refIndex.get(typeName) ?? [];
+  // A script name, or a variable whose type is one: report where that type is used.
+  const typeName = scriptDb.has(wl) ? wl : buildTypeMap(doc).get(wl);
+  if (typeName) return refIndex.get(typeName) ?? [];
+
+  // Otherwise a member — function, event, or property. Keep only the occurrences that
+  // resolve back to the same declaring type, so `PlayAnimation` on one script does not
+  // drag in every unrelated script that declares its own.
+  const sites = memberIndex.get(wl);
+  if (!sites) return [];
+  const ownerLower = resolveMemberOwner(doc, line, start, wl);
+  const matched    = ownerLower ? sites.filter(s => siteResolvesTo(s, ownerLower)) : sites;
+  return matched.map(s => s.loc);
 });
 
 // ── Go-to-definition ──────────────────────────────────────────────────────────
@@ -3662,19 +3840,26 @@ function findDeclarationLine(filePath: string, targetNameLower: string): number 
     try { lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/); } catch { return 0; }
   }
   for (let i = 0; i < lines.length; i++) {
-    const stripped = lines[i].replace(/;.*$/, '').trim();
+    // A declaration may wrap onto following lines with a trailing backslash. FUNC_RE wants the
+    // closing paren on the same line, so join the continuation before matching — while still
+    // reporting the line the declaration opened on.
+    const declLine = i;
+    let stripped = lines[i].replace(/;.*$/, '').trim();
+    while (/\\$/.test(stripped) && i + 1 < lines.length)
+      stripped = `${stripped.slice(0, -1).trim()} ${lines[++i].replace(/;.*$/, '').trim()}`;
+
     const sm = SCRIPTNAME_RE.exec(stripped);
-    if (sm && sm[1].toLowerCase() === targetNameLower) return i;
+    if (sm && sm[1].toLowerCase() === targetNameLower) return declLine;
     const fm = FUNC_RE.exec(stripped);
-    if (fm && fm[2].toLowerCase() === targetNameLower) return i;
+    if (fm && fm[2].toLowerCase() === targetNameLower) return declLine;
     const em = EVENT_RE.exec(stripped);
-    if (em && em[1].toLowerCase() === targetNameLower) return i;
+    if (em && em[1].toLowerCase() === targetNameLower) return declLine;
     const pm = PROP_RE.exec(stripped);
-    if (pm && pm[2].toLowerCase() === targetNameLower) return i;
+    if (pm && pm[2].toLowerCase() === targetNameLower) return declLine;
     const stM = /^\s*struct\s+(\w+)/i.exec(stripped);
-    if (stM && stM[1].toLowerCase() === targetNameLower) return i;
+    if (stM && stM[1].toLowerCase() === targetNameLower) return declLine;
     const ceM = /^\s*customevent\s+(\w+)/i.exec(stripped);
-    if (ceM && ceM[1].toLowerCase() === targetNameLower) return i;
+    if (ceM && ceM[1].toLowerCase() === targetNameLower) return declLine;
   }
   return 0;
 }
@@ -3773,6 +3958,59 @@ connection.onDefinition((params: TextDocumentPositionParams): Location | null =>
   if (!info?.sourcePath) return null;
   const ln = findDeclarationLine(info.sourcePath, targetLower ?? wl);
   return Location.create(`file://${info.sourcePath}`, Range.create(ln, 0, ln, 0));
+});
+
+// ── Go-to-implementation ──────────────────────────────────────────────────────
+// Papyrus has no interfaces, so "implementation" means the concrete end of an inheritance
+// edge: on a script name, the scripts extending it; on a member, the scripts overriding it.
+
+connection.onImplementation((params: TextDocumentPositionParams): Location[] => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+
+  const pos  = params.position;
+  const line = doc.getText({ start: { line: pos.line, character: 0 }, end: { line: pos.line, character: 9999 } });
+  let start = pos.character, end = pos.character;
+  while (start > 0 && /\w/.test(line[start - 1])) start--;
+  while (end < line.length && /\w/.test(line[end])) end++;
+  const word = line.slice(start, end);
+  if (!word) return [];
+  const wl = word.toLowerCase();
+
+  // Root types like ScriptObject sit above every script in the corpus; an uncapped answer
+  // there is thousands of file reads for a list nobody can use.
+  const LIMIT = 500;
+  const out: Location[] = [];
+
+  const push = (info: ScriptInfo, nameLower: string): void => {
+    if (!info.sourcePath || out.length >= LIMIT) return;
+    const ln = findDeclarationLine(info.sourcePath, nameLower);
+    out.push(Location.create(`file://${info.sourcePath}`, Range.create(ln, 0, ln, 0)));
+  };
+
+  if (scriptDb.has(wl)) {
+    for (const info of scriptDb.values()) {
+      if (out.length >= LIMIT) break;
+      if (info.name.toLowerCase() === wl) continue;      // the type itself is the declaration
+      if (chainHas(info.name.toLowerCase(), wl)) push(info, info.name.toLowerCase());
+    }
+    return out;
+  }
+
+  // A member: every script at or below its original declaration that redeclares it. Anchoring
+  // on the root declarer rather than the cursor's own type is what lets an override find its
+  // siblings instead of only itself.
+  const typeMap = buildTypeMap(doc);
+  const recv    = start > 0 && line[start - 1] === '.' ? scanReceiver(line, start - 1) : null;
+  const cursorType = recv ? resolveExprType(recv, typeMap) : typeMap.get('self');
+  if (!cursorType) return [];
+  const owner = rootDeclarerOf(cursorType, wl) ?? cursorType;
+
+  for (const info of scriptDb.values()) {
+    if (out.length >= LIMIT) break;
+    if (chainHas(info.name.toLowerCase(), owner) && declaresMember(info, wl)) push(info, wl);
+  }
+  return out;
 });
 
 // ── Code actions / quick fixes ───────────────────────────────────────────────
@@ -4069,25 +4307,44 @@ connection.languages.callHierarchy.onPrepare((params) => {
   if (!word) return null;
   const wordRange = Range.create(params.position.line, s, params.position.line, e);
   const item = makeCallHItem(word, params.textDocument.uri, wordRange);
-  (item as any).data = { funcNameLower: word.toLowerCase(), uri: params.textDocument.uri };
+  // Resolve the owning type now, while the document and cursor are still in hand —
+  // incomingCalls only receives this item back, and needs the owner to tell real callers
+  // from unrelated types that happen to declare the same name.
+  (item as any).data = {
+    funcNameLower: word.toLowerCase(),
+    uri:           params.textDocument.uri,
+    ownerLower:    resolveMemberOwner(doc, line, s, word.toLowerCase()),
+  };
   return [item];
 });
 
 connection.languages.callHierarchy.onIncomingCalls((params) => {
-  const data = (params.item as any).data as { funcNameLower: string } | undefined;
+  const data = (params.item as any).data as { funcNameLower: string; ownerLower?: string | null } | undefined;
   if (!data) return null;
-  const sites = funcCallIndex.get(data.funcNameLower) ?? [];
-  const byScript = new Map<string, { loc: Location; scriptName: string }[]>();
+
+  // Calls only, and only from inside a function — a bare name match anywhere in the corpus
+  // is not a caller.
+  let sites = (memberIndex.get(data.funcNameLower) ?? []).filter(s => s.isCall && s.enclosingFunc);
+  if (data.ownerLower) sites = sites.filter(s => siteResolvesTo(s, data.ownerLower!));
+
+  // One entry per calling function, not per calling file: two functions in the same script
+  // are two distinct callers.
+  const byFunc = new Map<string, MemberSite[]>();
   for (const s of sites) {
-    let arr = byScript.get(s.scriptName);
-    if (!arr) { arr = []; byScript.set(s.scriptName, arr); }
+    const key = `${s.scriptName.toLowerCase()}#${s.enclosingLine}`;
+    let arr = byFunc.get(key);
+    if (!arr) { arr = []; byFunc.set(key, arr); }
     arr.push(s);
   }
+
   const result: CallHierarchyIncomingCall[] = [];
-  for (const [scriptName, entries] of byScript) {
-    const info = scriptDb.get(scriptName.toLowerCase());
-    const uri  = info?.sourcePath ? `file://${info.sourcePath}` : entries[0].loc.uri;
-    const from = makeCallHItem(scriptName, uri, Range.create(0, 0, 0, 0));
+  for (const entries of byFunc.values()) {
+    const head  = entries[0];
+    const info  = scriptDb.get(head.scriptName.toLowerCase());
+    const uri   = info?.sourcePath ? `file://${info.sourcePath}` : head.loc.uri;
+    const range = Range.create(head.enclosingLine, 0, head.enclosingLine, 0);
+    const from  = makeCallHItem(head.enclosingFunc!, uri, range);
+    from.detail = head.scriptName;
     result.push({ from, fromRanges: entries.map(e => e.loc.range) });
   }
   return result.length ? result : null;
@@ -4136,7 +4393,11 @@ connection.languages.callHierarchy.onOutgoingCalls((params) => {
 
       const callRange = Range.create(i, m.index, i, m.index + m[1].length);
       const toUri     = ownerInfo.sourcePath ? `file://${ownerInfo.sourcePath}` : '';
-      result.push({ to: makeCallHItem(sigToName(sig), toUri, Range.create(0, 0, 0, 0)), fromRanges: [callRange] });
+      // Point at the callee's actual signature line; a hardcoded 0 sends every jump to line 1.
+      const toLine    = ownerInfo.sourcePath ? findDeclarationLine(ownerInfo.sourcePath, funcLower) : 0;
+      const to        = makeCallHItem(sigToName(sig), toUri, Range.create(toLine, 0, toLine, 0));
+      to.detail       = ownerInfo.name;
+      result.push({ to, fromRanges: [callRange] });
     }
   }
   return result.length ? result : null;
