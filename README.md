@@ -92,7 +92,10 @@ papyrus-check Scripts/Source              # a directory, searched recursively
 papyrus-check MyScript.psc --strict       # fail on warnings too
 papyrus-check Scripts/Source --json       # machine-readable
 papyrus-check MyScript.psc --verbose      # show which compiler and import dirs were used
+papyrus-check src --root .                # set the workspace root explicitly
 ```
+
+`--root` fixes the workspace root, which decides the import dirs and where `.papyrus-lsp.json` is searched from. It defaults to the common ancestor of the paths you passed, so checking a single deep file can otherwise resolve a narrower root than your project uses.
 
 ```
 MyScript.psc
@@ -109,9 +112,13 @@ Exit status is `0` when clean, `1` when diagnostics are found (warnings only cou
 The server logs what it resolved at startup. Check your editor's LSP log for:
 
 ```
+[papyrus-lsp] loaded 5037 scripts from scripts-db.json, overlaid 26 from source — 5056 total, 168 structs
 [papyrus-lsp] import dirs: /path/to/vanilla/Source, /your/workspace, ...
 [papyrus-lsp] compiler diagnostics enabled — /path/to/PapyrusCompiler.exe (mono /usr/bin/mono)
+[papyrus-lsp] reference index ready — 1596 types, 22388 members indexed
 ```
+
+The last line arrives shortly after the handshake — the reference index is built in the background so startup is not blocked. Find references, rename, and call hierarchy return empty until it lands.
 
 If you instead see `compiler diagnostics unavailable (...)`, the message names what's missing. Only the native suite runs in that mode: you'll still get parser, structural, and access errors on every keystroke, but **not** full type and event checking — so a bad cast or an unknown event name will go unreported. Set the missing path via `.papyrus-lsp.json` or the matching `PAPYRUS_LSP_*` variable.
 
@@ -127,6 +134,24 @@ Add to your Claude Code LSP plugin config (`.lsp.json`):
   }
 }
 ```
+
+Claude Code's `LSP` tool exposes nine operations. All nine are implemented:
+
+| Operation | On a `.psc` |
+|---|---|
+| `hover` | Signature, return type, doc comment |
+| `documentSymbol` | Every function, event, property, struct and custom event in the file |
+| `workspaceSymbol` | Script names plus their members; needs a query string, an empty one lists scripts only |
+| `goToDefinition` | Types, variables, struct types, and members through a receiver |
+| `goToImplementation` | Scripts extending a type, or overrides of a member |
+| `findReferences` | Types corpus-wide; members filtered to the declaring type |
+| `prepareCallHierarchy` | Anchors the function under the cursor |
+| `incomingCalls` | Calling functions, filtered by receiver type |
+| `outgoingCalls` | Callees, at their real signature lines |
+
+The tool has no diagnostics operation. Syntax errors reach Claude Code two other ways: pushed automatically when a file is opened or edited (surfacing as "Found N new diagnostic issues"), and pulled on demand by [`papyrus-check`](#command-line). Both drive the same server, so they never disagree.
+
+Note that the server is launched once per session. After rebuilding it, restart Claude Code to load the new binary.
 
 ## Features
 
@@ -160,7 +185,7 @@ Live, two-tier diagnostics modeled on clangd: fast checks appear as you type, th
 - **Call hierarchy** — incoming and outgoing calls for any function, attributed to the calling function rather than the file, and filtered by receiver type so same-named members on unrelated scripts stay out
 - **Semantic tokens** — proper syntax highlighting for types, functions, properties, parameters
 - **Code lens** — reference counts above `ScriptName`, `overrides ParentType` above overridden functions
-- **Folding** — collapses Function/Event/State/If/While/Struct blocks
+- **Folding** — collapses Function/Event/State/Property/Struct/Group/If/While blocks
 
 ### Workspace
 - **Live indexing** — open/edited `.psc` files are indexed immediately; completions and hover work for your own scripts without rebuilding the DB
@@ -178,7 +203,7 @@ Struct member completions work automatically. If `ActorValue` defines `Struct Ac
 
 ## Line continuation
 
-Papyrus `\` line continuations are handled in type inference and document indexing.
+Papyrus `\` line continuations are handled in type inference, document indexing, and declaration lookup — a signature wrapped across several lines still resolves to the line it opens on, so go-to-definition, workspace symbols, and call hierarchy land on the declaration rather than the top of the file.
 
 ## License
 
