@@ -1952,9 +1952,11 @@ function collectCompilerDiags(doc: TextDocument, cb: (diags: Diagnostic[]) => vo
   }
 
   // `;` is PapyrusCompiler's own list separator, not the platform's.
+  // Skyrim's compiler resolves the script by NAME through -import and reports
+  // "unable to locate script" for a bare temp path, so pass the name and put runDir first on the import list.
   const run = compilerArgv([
-    tempFile,
-    `-import=${cfg.scanDirs.join(';')}`,
+    scriptName,
+    `-import=${[runDir, ...cfg.scanDirs].join(';')}`,
     `-flags=${cfg.flagsFile}`,
     '-noasm',
     `-output=${runDir}`,
@@ -1965,7 +1967,7 @@ function collectCompilerDiags(doc: TextDocument, cb: (diags: Diagnostic[]) => vo
     cb([]); return null;
   }
 
-  return execFile(run.cmd, run.argv, { timeout: 15000 }, (_err, stdout, stderr) => {
+  return execFile(run.cmd, run.argv, { timeout: 90000 }, (_err, stdout, stderr) => {
     try { fs.rmSync(runDir, { recursive: true, force: true }); } catch {}
 
     const output = stdout + stderr;
@@ -3163,9 +3165,12 @@ documents.onDidClose(e => {
 function getDocForDiagnostics(uri: string): TextDocument | undefined {
   const open = documents.get(uri);
   if (open) return open;
-  const fsPath = uri.replace(/^file:\/\//, '');
+  // stripping "file://" leaves "/C:/..." on Windows, which fails to read, and
+  // the caller then reports an EMPTY diagnostic list = a silent "No issues found". Use the real converter.
+  let fsPath: string;
+  try { fsPath = require('url').fileURLToPath(uri); } catch { fsPath = decodeURIComponent(uri.replace(/^file:\/\//, '')); }
   try {
-    const text = fs.readFileSync(decodeURIComponent(fsPath), 'utf8');
+    const text = fs.readFileSync(fsPath, 'utf8');
     return TextDocument.create(uri, 'papyrus', 0, text);
   } catch {
     return undefined;
